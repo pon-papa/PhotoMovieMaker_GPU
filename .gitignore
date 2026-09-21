@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 書き出した動画
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# 作業用フォルダー
+output/
+temp/
+
+# 配布物（GitHub Releases で扱う）
+*.zip
