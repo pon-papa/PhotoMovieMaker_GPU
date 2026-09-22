@@ -9,6 +9,13 @@
 アプリが実行時にモデルをダウンロードすることはありません。
 写真がPCの外へ出ることもありません。
 
+## このフォルダーにモデルはありますか？
+
+- **配布ZIP（`PhotoMovieMaker_GPU_v0.1.0_Windows.zip` など）を展開した場合**
+  → すでに同梱済みです。何もしなくて構いません。
+- **GitHubからクローン／ZIPダウンロードした場合**
+  → `.onnx` はGit管理外なので入っていません。下の手順で取得してください。
+
 ## 必要なファイル
 
 | ファイル | 用途 | サイズ | SHA-256 |
@@ -44,4 +51,6 @@ curl -L -o models/object_detection_yolox_2022nov.onnx "https://media.githubuserc
 
 `.onnx` は `.gitignore` で除外しています。YOLOX が約34MBあり、
 Gitの履歴へ入れると以後ずっとクローンに付いてくるためです。
-配布時は GitHub Releases へ同梱するか、上のコマンドで取得してください。
+
+そのかわり、**GitHub Releases の配布ZIPにはモデルを同梱**しています。
+ZIPを展開すればモデルを別途取得することなく被写体追従を使えます。
