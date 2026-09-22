@@ -203,7 +203,8 @@ class TitleCard:
 @dataclass
 class BGMTiming:
     """BGM全体の入り方・つなぎ方・終わり方。区間ごとではなく全体で1組持つ。"""
-    first_offset: float = 0.5     # 動画開始から最初のBGMが鳴り出すまで
+    first_offset: float = 3.0     # 動画開始から最初のBGMが鳴り出すまで
+                                  # 冒頭を無音にして「溜め」を作るため既定は3.0秒
     first_fade_in: float = 1.5    # 冒頭のフェードイン
     fade_out: float = 1.5         # 曲の終わりのフェードアウト
     silence_gap: float = 0.7      # 曲と曲の間の無音
@@ -854,7 +855,7 @@ class App(tk.Tk):
         self.title_fg_var = tk.StringVar(value="#333333")
 
         # BGM全体設定（曲ごとではなく全体で1組）
-        self.bgm_offset_var = tk.DoubleVar(value=0.5)
+        self.bgm_offset_var = tk.DoubleVar(value=3.0)
         self.bgm_first_fade_var = tk.DoubleVar(value=1.5)
         self.bgm_fadeout_var = tk.DoubleVar(value=1.5)
         self.bgm_gap_var = tk.DoubleVar(value=0.7)
