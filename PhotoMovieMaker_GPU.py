@@ -271,8 +271,9 @@ class VideoRenderer:
         self.camera_mode = camera_mode
         self.settings_extra = settings_extra or {}
         # 写真ごとの解析結果。画像は持たず、bbox由来の軽い値だけ。
-        self.detections: dict[int, object] = {}
-        self.source_sizes: dict[int, tuple[int, int]] = {}
+        # 並べ替えても別の写真へ結果が付かないよう、キーは写真のパスにする。
+        self.detections: dict[str, object] = {}
+        self.source_sizes: dict[str, tuple[int, int]] = {}
 
         self.interval_frames = max(1, round(self.interval * self.fps))
         self.transition_frames = max(0, round(self.transition * self.fps))
@@ -424,14 +425,14 @@ class VideoRenderer:
                     rgb = np.asarray(
                         ImageOps.exif_transpose(im).convert("RGB"), dtype=np.uint8
                     )
-                self.source_sizes[i] = (rgb.shape[1], rgb.shape[0])
+                self.source_sizes[str(path)] = (rgb.shape[1], rgb.shape[0])
                 det = detector.detect(path.name, rgb)
                 del rgb
             except Exception as e:
                 det = subject_detector.SubjectDetection(
                     filename=path.name, note=f"analysis error: {type(e).__name__}"
                 )
-            self.detections[i] = det
+            self.detections[str(path)] = det
             self.q.put((
                 "status",
                 f"被写体解析中: {i+1}/{total}  顔{det.face_count} 犬{det.dog_count}"
@@ -444,8 +445,11 @@ class VideoRenderer:
         ぼかし背景ONなら contain + 中央paste、OFFなら fit(中央クロップ)と
         同じ幾何で計算する。戻り値は最終canvasのピクセル座標。
         """
-        det = self.detections.get(index)
-        size = self.source_sizes.get(index)
+        if not (0 <= index < len(self.images)):
+            return None
+        key = str(self.images[index])
+        det = self.detections.get(key)
+        size = self.source_sizes.get(key)
         if det is None or size is None or not det.has_target:
             return None
 
@@ -778,7 +782,11 @@ class VideoRenderer:
         戻り値: [(開始秒, 長さ秒, フェードイン秒, フェードアウト秒), ...]
         """
         t = self.bgm_timing
-        MIN_AUDIO = 0.05  # これ以下には縮めない
+        MIN_AUDIO = 0.05   # 計算上これ以下には縮めない
+        # 実際に鳴らす下限。これより短くなった区間は鳴らさず無音にする。
+        # 0.1秒だけ音が出ても聞こえないうえ、そこまで短い音声を
+        # FFmpegのフィルターへ渡すと合成が失敗することがあるため。
+        MIN_AUDIBLE = 0.30
         plan = []
 
         for i, s_ in enumerate(segs):
@@ -824,7 +832,11 @@ class VideoRenderer:
                 fade_in *= scale
                 fade_out *= scale
 
-            plan.append((actual_start, duration, fade_in, fade_out))
+            if duration < MIN_AUDIBLE:
+                # 短すぎるので鳴らさない。この区間は無音になる。
+                continue
+
+            plan.append((s_, actual_start, duration, fade_in, fade_out))
 
         return plan
 
@@ -840,6 +852,13 @@ class VideoRenderer:
 
         plan = self.bgm_plan(segs)
 
+        if not plan:
+            # 鳴らせる長さの区間が残らなかった。無音のまま完成させる。
+            if self.output.exists():
+                self.output.unlink()
+            shutil.move(str(silent_video), str(self.output))
+            return
+
         cmd = [
             self.ffmpeg, "-y",
             "-hide_banner", "-loglevel", "error",
@@ -847,13 +866,13 @@ class VideoRenderer:
         ]
 
         # 各BGMは短ければ自動ループ
-        for s_ in segs:
-            cmd += ["-stream_loop", "-1", "-i", str(s_.audio_path)]
+        for entry in plan:
+            cmd += ["-stream_loop", "-1", "-i", str(entry[0].audio_path)]
 
         filters = []
         labels = []
 
-        for idx, (start, duration, fade_in, fade_out) in enumerate(plan, start=1):
+        for idx, (_seg, start, duration, fade_in, fade_out) in enumerate(plan, start=1):
             chain = (
                 f"[{idx}:a]"
                 f"atrim=duration={duration:.6f},"
@@ -933,6 +952,8 @@ class VideoRenderer:
                 "first": names[0] if names else "",
                 "last": names[-1] if names else "",
             },
+            # 実際に上映した順番。フォルダーは上に記録してあるのでファイル名だけ。
+            "image_order": names,
             "video": {
                 "width": self.w,
                 "height": self.h,
@@ -966,20 +987,25 @@ class VideoRenderer:
             counts: dict[str, int] = {}
             for det in self.detections.values():
                 counts[det.mode] = counts.get(det.mode, 0) + 1
+            shown = [
+                (i, self.detections[str(pth)])
+                for i, pth in enumerate(self.images)
+                if str(pth) in self.detections
+            ]
             data["subject_camera"] = {
                 "analyzed": len(self.detections),
                 "by_mode": counts,
                 "photos": [
                     {
                         "photo": i + 1,
-                        "file": self.detections[i].filename,
-                        "face_count": self.detections[i].face_count,
-                        "dog_count": self.detections[i].dog_count,
-                        "mode": self.detections[i].mode,
-                        "target_x": self.detections[i].target_x,
-                        "target_y": self.detections[i].target_y,
+                        "file": det.filename,
+                        "face_count": det.face_count,
+                        "dog_count": det.dog_count,
+                        "mode": det.mode,
+                        "target_x": det.target_x,
+                        "target_y": det.target_y,
                     }
-                    for i in sorted(self.detections)
+                    for i, det in shown
                 ],
             }
 
@@ -1015,6 +1041,227 @@ class VideoRenderer:
         self.write_settings_file(self.encoder_used)
         self.q.put(("progress", 100.0))
         self.q.put(("done", str(self.output)))
+
+
+class PhotoOrderDialog(tk.Toplevel):
+    """写真の上映順を並べ替えるダイアログ。
+
+    元の写真ファイルには一切触れない。名前の変更も移動もコピーもしない。
+    並べ替えるのはアプリが持っている一覧の順番だけ。
+    一覧はパスと名前しか持たないので、写真が何百枚あっても軽いまま。
+    """
+
+    MARK_ON = "レ"
+    MARK_OFF = "-"
+
+    def __init__(self, master, entries: list[tuple[Path, bool]]):
+        super().__init__(master)
+        self.title("写真の順番と使用する写真")
+        self.result = None
+        self.iid_path: dict[str, Path] = {}
+        self.iid_used: dict[str, bool] = {}
+        self._drag_iid = None
+
+        frm = ttk.Frame(self, padding=12)
+        frm.pack(fill="both", expand=True)
+
+        ttk.Label(
+            frm,
+            text="上から順に動画へ出てきます。"
+                 "行をドラッグするか、選んで「上へ」「下へ」で入れ替えます。" + chr(10)
+                 + "「上映」欄をクリック（またはスペースキー）で、"
+                   "その写真を使うかどうかを切り替えます。",
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+
+        body = ttk.Frame(frm)
+        body.pack(fill="both", expand=True)
+
+        self.tree = ttk.Treeview(
+            body, columns=("use", "no", "name"), show="headings",
+            height=20, selectmode="extended"
+        )
+        self.tree.heading("use", text="上映")
+        self.tree.heading("no", text="番号")
+        self.tree.heading("name", text="ファイル名")
+        self.tree.column("use", width=50, anchor="center", stretch=False)
+        self.tree.column("no", width=60, anchor="e", stretch=False)
+        self.tree.column("name", width=500)
+        # 使わない写真は灰色にして見分けやすくする
+        self.tree.tag_configure("off", foreground="#999999")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        bar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
+        bar.pack(side="left", fill="y")
+        self.tree.configure(yscrollcommand=bar.set)
+
+        side = ttk.Frame(body)
+        side.pack(side="left", fill="y", padx=(12, 0))
+        ttk.Button(side, text="上へ", width=14, command=self.move_up).pack(pady=(0, 4))
+        ttk.Button(side, text="下へ", width=14, command=self.move_down).pack(pady=(0, 4))
+        ttk.Button(side, text="自然順に戻す", width=14,
+                   command=self.reset_natural).pack(pady=(0, 14))
+        ttk.Separator(side, orient="horizontal").pack(fill="x", pady=(0, 12))
+        ttk.Button(side, text="すべて選択", width=14,
+                   command=lambda: self.set_all(True)).pack(pady=(0, 4))
+        ttk.Button(side, text="すべて解除", width=14,
+                   command=lambda: self.set_all(False)).pack(pady=(0, 4))
+        ttk.Button(side, text="選択を反転", width=14, command=self.invert_all).pack()
+
+        self.count_label = ttk.Label(frm, text="")
+        self.count_label.pack(anchor="w", pady=(8, 0))
+
+        buttons = ttk.Frame(frm)
+        buttons.pack(fill="x", pady=(10, 0))
+        ttk.Button(buttons, text="キャンセル", command=self.destroy).pack(side="right")
+        ttk.Button(buttons, text="この順番で決定", command=self.ok).pack(side="right", padx=(0, 8))
+
+        self.fill(entries)
+
+        # ドラッグ&ドロップ。ttk標準のイベントだけで完結させる。
+        self.tree.bind("<ButtonPress-1>", self.on_drag_start)
+        self.tree.bind("<B1-Motion>", self.on_drag_motion)
+        self.tree.bind("<ButtonRelease-1>", self.on_drag_end)
+        self.tree.bind("<space>", self.toggle_selected)
+
+        self.transient(master)
+        self.grab_set()
+        self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.wait_visibility()
+        self.focus_force()
+
+    # ---------------- 一覧 ----------------
+
+    def fill(self, entries: list[tuple[Path, bool]]):
+        self.tree.delete(*self.tree.get_children())
+        self.iid_path.clear()
+        self.iid_used.clear()
+        for i, (path, used) in enumerate(entries):
+            iid = "p" + str(i)
+            self.iid_path[iid] = path
+            self.iid_used[iid] = bool(used)
+            self.tree.insert("", "end", iid=iid, values=("", "", path.name))
+        self.renumber()
+
+    def current_entries(self) -> list[tuple[Path, bool]]:
+        return [(self.iid_path[iid], self.iid_used[iid])
+                for iid in self.tree.get_children()]
+
+    def current_order(self) -> list[Path]:
+        return [self.iid_path[iid] for iid in self.tree.get_children()]
+
+    def renumber(self):
+        """上映番号は「使う写真」だけに振る。使わない写真は - と表示する。"""
+        items = self.tree.get_children()
+        shown = 0
+        for iid in items:
+            if self.iid_used[iid]:
+                shown += 1
+                self.tree.set(iid, "use", self.MARK_ON)
+                self.tree.set(iid, "no", shown)
+                self.tree.item(iid, tags=())
+            else:
+                self.tree.set(iid, "use", self.MARK_OFF)
+                self.tree.set(iid, "no", "-")
+                self.tree.item(iid, tags=("off",))
+        self.count_label.config(
+            text=f"一覧 {len(items)}枚 / 動画に使う {shown}枚"
+                 + ("" if shown else "   ← このままでは動画を作れません")
+        )
+
+    # ---------------- 使う / 使わない ----------------
+
+    def toggle(self, iid: str):
+        self.iid_used[iid] = not self.iid_used[iid]
+        self.renumber()
+
+    def toggle_selected(self, event=None):
+        for iid in self.tree.selection():
+            self.iid_used[iid] = not self.iid_used[iid]
+        self.renumber()
+        return "break"
+
+    def set_all(self, used: bool):
+        for iid in self.tree.get_children():
+            self.iid_used[iid] = used
+        self.renumber()
+
+    def invert_all(self):
+        for iid in self.tree.get_children():
+            self.iid_used[iid] = not self.iid_used[iid]
+        self.renumber()
+
+    # ---------------- 並べ替え ----------------
+
+    def shift(self, delta: int):
+        items = list(self.tree.get_children())
+        selected = set(self.tree.selection())
+        if not selected or not items:
+            return
+        idx = sorted(i for i, iid in enumerate(items) if iid in selected)
+        if delta < 0 and idx[0] == 0:
+            return
+        if delta > 0 and idx[-1] == len(items) - 1:
+            return
+        for i in (idx if delta < 0 else list(reversed(idx))):
+            items[i], items[i + delta] = items[i + delta], items[i]
+        for pos, iid in enumerate(items):
+            self.tree.move(iid, "", pos)
+        self.renumber()
+        self.tree.see(items[idx[0] + delta])
+
+    def move_up(self):
+        self.shift(-1)
+
+    def move_down(self):
+        self.shift(1)
+
+    def reset_natural(self):
+        entries = self.current_entries()
+        natural = sorted(entries, key=lambda e: natural_key(e[0]))
+        if [e[0] for e in entries] == [e[0] for e in natural]:
+            return
+        if not messagebox.askyesno(
+            "写真の順番",
+            "今の並べ替えを破棄して、ファイル名順に戻します。よろしいですか？"
+            + chr(10) + "（使う・使わないの指定はそのまま残ります）",
+            parent=self,
+        ):
+            return
+        self.fill(natural)
+
+    # ---------------- ドラッグ&ドロップ ----------------
+
+    def on_drag_start(self, event):
+        self._drag_iid = None
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            return
+        iid = self.tree.identify_row(event.y)
+        if not iid:
+            return
+        # 「上映」欄のクリックは、並べ替えではなく使う/使わないの切り替え
+        if self.tree.identify_column(event.x) == "#1":
+            self.toggle(iid)
+            return
+        self._drag_iid = iid
+
+    def on_drag_motion(self, event):
+        if not self._drag_iid:
+            return
+        target = self.tree.identify_row(event.y)
+        if target and target != self._drag_iid:
+            self.tree.move(self._drag_iid, "", self.tree.index(target))
+
+    def on_drag_end(self, event):
+        if self._drag_iid:
+            self._drag_iid = None
+            self.renumber()
+
+    # ---------------- 決定 ----------------
+
+    def ok(self):
+        self.result = self.current_entries()
+        self.destroy()
 
 
 class BGMDialog(tk.Toplevel):
@@ -1141,7 +1388,11 @@ class App(tk.Tk):
         self.bgm_fadein_var = tk.DoubleVar(value=1.5)
         self.bgm_final_var = tk.DoubleVar(value=3.0)
 
+        # self.images は一覧の全部（並べ替え後の順番）。
+        # そのうち「使わない」と指定されたものを excluded に持つ。
+        # 動画・BGM番号・被写体解析はすべて shown_images() を基準にする。
         self.images: list[Path] = []
+        self.excluded: set[Path] = set()
         self.bgm_segments: list[BGMSegment] = []
 
         self.build_ui()
@@ -1164,6 +1415,13 @@ class App(tk.Tk):
         ttk.Label(r, text="写真フォルダー", width=14).pack(side="left")
         ttk.Entry(r, textvariable=self.folder_var).pack(side="left", fill="x", expand=True, padx=6)
         ttk.Button(r, text="選択", command=self.choose_folder).pack(side="left")
+
+        r = ttk.Frame(inp); r.pack(fill="x", pady=4)
+        ttk.Label(r, text="写真の順番", width=14).pack(side="left")
+        self.order_label = ttk.Label(r, text="写真フォルダーを選択してください。")
+        self.order_label.pack(side="left", padx=6)
+        self.order_btn = ttk.Button(r, text="並べ替え", command=self.open_photo_order)
+        self.order_btn.pack(side="right")
 
         r = ttk.Frame(inp); r.pack(fill="x", pady=4)
         ttk.Label(r, text="出力MP4", width=14).pack(side="left")
@@ -1362,14 +1620,23 @@ class App(tk.Tk):
                 key=natural_key,
             )
 
+        # 別フォルダーを選び直したら、前のフォルダーの並び順も
+        # 使う/使わないの指定も引き継がない。最初は全部を使う。
+        self.excluded.clear()
         self.bgm_segments.clear()
         self.refresh_bgm_tree()
         self.update_summary()
+        self.update_order_label()
 
     def update_summary(self):
-        n = len(self.images)
-        if not n:
+        shown = self.shown_images()
+        n = len(shown)
+        if not self.images:
             self.summary.config(text="画像ファイルが見つかりません。")
+            return
+        if not n:
+            self.summary.config(
+                text=f"使用する写真がありません（一覧 {len(self.images)}枚はすべて除外中）。")
             return
         title_seconds = (
             float(self.title_dur_var.get()) if self.title_on_var.get() else 0.0
@@ -1378,16 +1645,17 @@ class App(tk.Tk):
         mins = int(duration // 60)
         secs = int(round(duration % 60))
         head = f"タイトル{title_seconds:g}秒 + " if title_seconds else ""
+        skipped = f"（{len(self.excluded)}枚は使いません）" if self.excluded else ""
         self.summary.config(
-            text=f"{n}枚 / 予想動画時間 約 {head}{mins}分{secs:02d}秒 / "
-                 f"先頭: {self.images[0].name} / 最後: {self.images[-1].name}"
+            text=f"{n}枚{skipped} / 予想動画時間 約 {head}{mins}分{secs:02d}秒 / "
+                 f"先頭: {shown[0].name} / 最後: {shown[-1].name}"
         )
 
     def add_bgm(self):
-        if not self.images:
+        if not self.shown_images():
             messagebox.showinfo("BGM", "先に写真フォルダーを選択してください。")
             return
-        dlg = BGMDialog(self, [p.name for p in self.images])
+        dlg = BGMDialog(self, [p.name for p in self.shown_images()])
         self.wait_window(dlg)
         if dlg.result:
             self.bgm_segments.append(dlg.result)
@@ -1405,7 +1673,7 @@ class App(tk.Tk):
         if idx is None:
             return
         seg = self.bgm_segments[idx]
-        dlg = BGMDialog(self, [p.name for p in self.images], initial=seg)
+        dlg = BGMDialog(self, [p.name for p in self.shown_images()], initial=seg)
         self.wait_window(dlg)
         if dlg.result:
             self.bgm_segments[idx] = dlg.result
@@ -1422,13 +1690,59 @@ class App(tk.Tk):
     def refresh_bgm_tree(self):
         for item in self.tree.get_children():
             self.tree.delete(item)
+        shown = self.shown_images()
         for i, s in enumerate(self.bgm_segments):
-            start = self.images[s.start_index].name if self.images else ""
-            end = self.images[s.end_index].name if self.images else ""
+            # 写真番号は「使う写真だけの上映順」を指す
+            start = shown[s.start_index].name if s.start_index < len(shown) else "-"
+            end = shown[s.end_index].name if s.end_index < len(shown) else "-"
             self.tree.insert(
                 "", "end", iid=str(i),
                 values=(start, end, s.audio_path.name)
             )
+
+    def shown_images(self) -> list[Path]:
+        """実際に動画へ使う写真だけを、上映順で返す。
+
+        BGM区間の「写真1」「写真2」もこの並びを指す。
+        """
+        return [p for p in self.images if p not in self.excluded]
+
+    def photo_entries(self) -> list[tuple[Path, bool]]:
+        return [(p, p not in self.excluded) for p in self.images]
+
+    def update_order_label(self):
+        if not self.images:
+            self.order_label.config(text="画像がありません。")
+            return
+        shown = self.shown_images()
+        natural = sorted(self.images, key=natural_key)
+        head = "ファイル名順" if self.images == natural else "並べ替え済み"
+        if self.excluded:
+            self.order_label.config(
+                text=f"{head} / 動画に使う {len(shown)}枚"
+                     f"（{len(self.excluded)}枚は使いません）")
+        else:
+            self.order_label.config(text=f"{head}（{len(self.images)}枚）")
+
+    def open_photo_order(self):
+        if self.worker and self.worker.is_alive():
+            messagebox.showinfo(
+                APP_NAME, "動画の作成中は写真の順番を変更できません。")
+            return
+        if not self.images:
+            messagebox.showinfo(APP_NAME, "先に写真フォルダーを選択してください。")
+            return
+        dlg = PhotoOrderDialog(self, self.photo_entries())
+        self.wait_window(dlg)
+        if dlg.result is None:
+            return
+        self.images = [p for p, _ in dlg.result]
+        self.excluded = {p for p, used in dlg.result if not used}
+        # BGM区間は「上映順の何枚目か」を指す。並べ替え後もその意味のまま。
+        # 一覧の表示ファイル名だけ新しい順番に合わせて更新する。
+        self.refresh_bgm_tree()
+        self.update_summary()
+        self.update_order_label()
 
     def subject_models_missing(self) -> list[str]:
         """モデルファイルの有無だけを見る。重い読み込みはここではしない。"""
@@ -1494,6 +1808,11 @@ class App(tk.Tk):
     def validate(self):
         if not self.images:
             raise ValueError("写真フォルダーに画像がありません。")
+        if not self.shown_images():
+            raise ValueError(
+                "使用する写真がありません。" + chr(10)
+                + "「写真の順番」の並べ替え画面で、動画に使う写真を選んでください。"
+            )
         if not self.output_var.get():
             raise ValueError("出力MP4を指定してください。")
         if float(self.interval_var.get()) <= 0:
@@ -1531,12 +1850,13 @@ class App(tk.Tk):
         self.stop_event.clear()
         self.start_btn.config(state="disabled")
         self.cancel_btn.config(state="normal")
+        self.order_btn.config(state="disabled")
         self.progress["value"] = 0
 
         w, h = [int(x) for x in self.resolution_var.get().split("x")]
 
         renderer = VideoRenderer(
-            image_paths=self.images.copy(),
+            image_paths=self.shown_images(),
             output_path=Path(self.output_var.get()),
             width=w,
             height=h,
@@ -1553,6 +1873,11 @@ class App(tk.Tk):
             bgm_timing=self.bgm_timing(),
             camera_mode=self.camera_var.get(),
             settings_extra={
+                # 一覧の全部と、それぞれを使ったかどうか。パスは残さない。
+                "images": [
+                    {"filename": p.name, "included": p not in self.excluded}
+                    for p in self.images
+                ],
                 "gui": {
                     "photo_folder": self.folder_var.get(),
                     "encoder_label": self.encoder_var.get(),
@@ -1600,6 +1925,7 @@ class App(tk.Tk):
                 elif kind == "done":
                     self.start_btn.config(state="normal")
                     self.cancel_btn.config(state="disabled")
+                    self.order_btn.config(state="normal")
                     self.status.config(text="完成しました。")
                     settings = Path(item[1]).with_name(
                         Path(item[1]).stem + "_settings.json")
@@ -1618,11 +1944,13 @@ class App(tk.Tk):
                 elif kind == "cancelled":
                     self.start_btn.config(state="normal")
                     self.cancel_btn.config(state="disabled")
+                    self.order_btn.config(state="normal")
                     self.status.config(text="中止しました。")
 
                 elif kind == "error":
                     self.start_btn.config(state="normal")
                     self.cancel_btn.config(state="disabled")
+                    self.order_btn.config(state="normal")
                     self.status.config(text="エラー")
                     messagebox.showerror(APP_NAME, item[1][-7000:])
 
