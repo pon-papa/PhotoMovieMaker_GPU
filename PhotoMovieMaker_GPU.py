@@ -196,6 +196,7 @@ class TitleCard:
     date: str = ""
     duration: float = 5.0        # タイトルを見せる秒数
     fade_seconds: float = 1.0    # タイトル→写真1 のクロスフェード
+    text_fade_seconds: float = 1.5  # 白背景の上で文字だけが現れるまでの秒数
     bg_color: str = "#FFFFFF"
     fg_color: str = "#333333"
 
@@ -265,9 +266,16 @@ class VideoRenderer:
                 max(0, round(self.title.fade_seconds * self.fps)),
                 self.title_frames,
             )
+            # 文字だけのフェードイン。タイトル区間の内側の演出なので
+            # 総フレーム数（＝動画の長さ）には影響しない。
+            self.title_text_fade_frames = min(
+                max(0, round(self.title.text_fade_seconds * self.fps)),
+                self.title_frames,
+            )
         else:
             self.title_frames = 0
             self.title_fade_frames = 0
+            self.title_text_fade_frames = 0
 
         # 最終写真も interval 秒見せる
         self.total_frames = self.title_frames + len(self.images) * self.interval_frames
@@ -308,6 +316,15 @@ class VideoRenderer:
                 )
 
         return np.asarray(canvas, dtype=np.uint8)
+
+    def render_title_background(self) -> np.ndarray:
+        """タイトルカードの背景だけ。文字フェードイン中の下地に使う。
+        文字入りcanvasと背景canvasを混ぜると、背景画素は同じ値どうしの
+        混合になるので一切変化せず、文字のopacityだけが変わる。"""
+        rgb = ImageColor.getrgb(self.title.bg_color)[:3]
+        return np.ascontiguousarray(
+            np.full((self.h, self.w, 3), rgb, dtype=np.uint8)
+        )
 
     def render_title_canvas(self) -> np.ndarray:
         """タイトルカードを1枚の静止画として作る。
@@ -476,12 +493,20 @@ class VideoRenderer:
             if self.title_frames:
                 self.q.put(("status", "タイトルカードを作成中…"))
                 title_canvas = self.render_title_canvas()
+                title_bg = (self.render_title_background()
+                            if self.title_text_fade_frames > 0 else None)
 
                 for local in range(self.title_frames):
                     if self.stop_event.is_set():
                         raise InterruptedError("処理を中止しました。")
 
-                    frame = title_canvas
+                    # 白背景は固定のまま、文字だけを0%から100%へ浮き出させる。
+                    # frame 0 で0%、text_fade_frames で100%。
+                    if title_bg is not None and local < self.title_text_fade_frames:
+                        a = smoothstep(local / self.title_text_fade_frames)
+                        frame = cv2.addWeighted(title_bg, 1.0 - a, title_canvas, a, 0.0)
+                    else:
+                        frame = title_canvas
                     # タイトル区間の最後で写真1へクロスフェードする。
                     # 写真1の時間軸は「写真1の区間開始」が0なので、ここでは負の値。
                     # これにより動画全体が余計に伸びず、写真1の動きも途切れない。
@@ -493,7 +518,7 @@ class VideoRenderer:
                             current, motions[0], k - self.title_fade_frames
                         )
                         a = smoothstep((k + 1) / self.title_fade_frames)
-                        frame = cv2.addWeighted(title_canvas, 1.0 - a, nxt, a, 0.0)
+                        frame = cv2.addWeighted(frame, 1.0 - a, nxt, a, 0.0)
 
                     emit(frame)
 
@@ -851,6 +876,7 @@ class App(tk.Tk):
         self.title_date_var = tk.StringVar()
         self.title_dur_var = tk.DoubleVar(value=5.0)
         self.title_fade_var = tk.DoubleVar(value=1.0)
+        self.title_text_fade_var = tk.DoubleVar(value=1.5)
         self.title_bg_var = tk.StringVar(value="#FFFFFF")
         self.title_fg_var = tk.StringVar(value="#333333")
 
@@ -963,6 +989,11 @@ class App(tk.Tk):
         ttk.Label(title, text="秒　　背景色").grid(row=4, column=4, sticky="e", pady=(6, 0))
         ttk.Entry(title, textvariable=self.title_bg_var, width=10).grid(
             row=4, column=5, sticky="w", pady=(6, 0))
+        ttk.Label(title, text="文字フェードイン").grid(row=5, column=0, sticky="w", pady=(3, 0))
+        ttk.Spinbox(title, from_=0, to=30, increment=0.1, textvariable=self.title_text_fade_var,
+                    width=7).grid(row=5, column=1, sticky="w", pady=(3, 0))
+        ttk.Label(title, text="秒　　（白背景の上に文字だけが現れます。0で最初から表示）").grid(
+            row=5, column=2, columnspan=2, sticky="w", pady=(3, 0))
         ttk.Label(title, text="文字色").grid(row=5, column=4, sticky="e", pady=(3, 0))
         ttk.Entry(title, textvariable=self.title_fg_var, width=10).grid(
             row=5, column=5, sticky="w", pady=(3, 0))
@@ -1140,6 +1171,7 @@ class App(tk.Tk):
             date=self.title_date_var.get(),
             duration=float(self.title_dur_var.get()),
             fade_seconds=float(self.title_fade_var.get()),
+            text_fade_seconds=float(self.title_text_fade_var.get()),
             bg_color=parse_color(self.title_bg_var.get(), "#FFFFFF"),
             fg_color=parse_color(self.title_fg_var.get(), "#333333"),
         )
@@ -1177,6 +1209,10 @@ class App(tk.Tk):
             if float(self.title_fade_var.get()) > float(self.title_dur_var.get()):
                 raise ValueError(
                     "タイトル→写真フェードは、タイトルの表示時間以下にしてください。"
+                )
+            if float(self.title_text_fade_var.get()) > float(self.title_dur_var.get()):
+                raise ValueError(
+                    "文字フェードインは、タイトルの表示時間以下にしてください。"
                 )
             for label, value in (("背景色", self.title_bg_var.get()),
                                  ("文字色", self.title_fg_var.get())):
