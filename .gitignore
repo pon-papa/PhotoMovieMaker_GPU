@@ -16,3 +16,9 @@ temp/
 
 # 配布物（GitHub Releases で扱う）
 *.zip
+
+# 検出モデル（サイズが大きいのでGit管理外。models/README.md の手順で取得）
+models/*.onnx
+
+# 書き出し時に保存される設定ファイル（テスト生成物）
+*_settings.json

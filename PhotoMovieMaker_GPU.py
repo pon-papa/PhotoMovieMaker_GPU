@@ -19,13 +19,15 @@ from __future__ import annotations
 
 import os
 import re
+import json
 import random
 import shutil
 import tempfile
 import subprocess
 import threading
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, asdict
+from datetime import datetime
 from pathlib import Path
 from queue import Queue, Empty
 
@@ -41,8 +43,18 @@ try:
 except Exception:
     imageio_ffmpeg = None
 
+# 被写体追従カメラ（実験機能）。無くても従来カメラワークは動く。
+try:
+    import subject_detector
+except Exception:
+    subject_detector = None
+
 
 APP_NAME = "PhotoMovieMaker GPU"
+
+# カメラワーク。既定は従来方式で、何も設定しなければ今までと同じ結果になる。
+CAMERA_LEGACY = "legacy"
+CAMERA_SUBJECT = "subject"
 SUPPORTED_IMAGES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 AUDIO_FILETYPES = [
     ("Audio", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
@@ -237,6 +249,8 @@ class VideoRenderer:
         stop_event: threading.Event,
         title: "TitleCard | None" = None,
         bgm_timing: "BGMTiming | None" = None,
+        camera_mode: str = CAMERA_LEGACY,
+        settings_extra: dict | None = None,
     ):
         self.images = image_paths
         self.output = output_path
@@ -254,6 +268,11 @@ class VideoRenderer:
 
         self.title = title if (title and title.enabled) else None
         self.bgm_timing = bgm_timing or BGMTiming()
+        self.camera_mode = camera_mode
+        self.settings_extra = settings_extra or {}
+        # 写真ごとの解析結果。画像は持たず、bbox由来の軽い値だけ。
+        self.detections: dict[int, object] = {}
+        self.source_sizes: dict[int, tuple[int, int]] = {}
 
         self.interval_frames = max(1, round(self.interval * self.fps))
         self.transition_frames = max(0, round(self.transition * self.fps))
@@ -284,6 +303,7 @@ class VideoRenderer:
         self.title_duration = self.title_frames / self.fps
         self.photo_span = self.interval_frames / self.fps
 
+        self.encoder_used = ""
         self.ffmpeg = find_ffmpeg()
         self.nvenc_available = ffmpeg_has_nvenc(self.ffmpeg)
 
@@ -363,6 +383,135 @@ class VideoRenderer:
 
         return np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
 
+    # ------------------------------------------------------------------
+    # 被写体追従カメラ（実験機能）
+    # 従来のパン＆ズームには手を入れず、パン方向だけを差し替える。
+    # 被写体が1つだけ見つかった写真以外は、すべて従来方式のまま。
+    # ------------------------------------------------------------------
+
+    def analyze_subjects(self):
+        """写真ごとに1回だけ検出を走らせる。モデルのloadも1回だけ。
+
+        失敗しても例外を投げず、その写真（または全体）を従来方式へ戻す。
+        """
+        if subject_detector is None:
+            self.q.put(("warning",
+                        "被写体検出モジュール(subject_detector.py)が読み込めません。" + chr(10)
+                        + "従来カメラワークで作成します。"))
+            return
+
+        try:
+            detector = subject_detector.SubjectDetector()
+        except Exception as e:
+            self.q.put(("warning",
+                        "被写体検出の準備に失敗しました。従来カメラワークで作成します。" + chr(10)
+                        + f"{type(e).__name__}: {e}"))
+            return
+
+        if not detector.available:
+            # モデルが無い等。動画作成そのものは従来方式で続行する。
+            self.q.put(("warning", detector.unavailable_reason))
+            return
+
+        total = len(self.images)
+        for i, path in enumerate(self.images):
+            if self.stop_event.is_set():
+                raise InterruptedError("処理を中止しました。")
+            try:
+                with Image.open(path) as im:
+                    # 検出は「元写真」に対して行う。
+                    # ぼかし背景を合成したcanvasでは被写体が二重に写るため。
+                    rgb = np.asarray(
+                        ImageOps.exif_transpose(im).convert("RGB"), dtype=np.uint8
+                    )
+                self.source_sizes[i] = (rgb.shape[1], rgb.shape[0])
+                det = detector.detect(path.name, rgb)
+                del rgb
+            except Exception as e:
+                det = subject_detector.SubjectDetection(
+                    filename=path.name, note=f"analysis error: {type(e).__name__}"
+                )
+            self.detections[i] = det
+            self.q.put((
+                "status",
+                f"被写体解析中: {i+1}/{total}  顔{det.face_count} 犬{det.dog_count}"
+                f" → {det.mode}  {path.name}",
+            ))
+
+    def subject_target_on_canvas(self, index: int):
+        """元写真の正規化座標を、実際に表示される前景写真上の位置へ写す。
+
+        ぼかし背景ONなら contain + 中央paste、OFFなら fit(中央クロップ)と
+        同じ幾何で計算する。戻り値は最終canvasのピクセル座標。
+        """
+        det = self.detections.get(index)
+        size = self.source_sizes.get(index)
+        if det is None or size is None or not det.has_target:
+            return None
+
+        iw, ih = size
+        if iw <= 0 or ih <= 0:
+            return None
+        nx, ny = det.target_x, det.target_y
+        im_ratio = iw / ih
+        dest_ratio = self.w / self.h
+
+        if self.blur_background:
+            # ImageOps.contain と同じ大きさに縮小し、中央へ貼る
+            if im_ratio > dest_ratio:
+                fw, fh = self.w, max(1, round(ih / iw * self.w))
+            elif im_ratio < dest_ratio:
+                fw, fh = max(1, round(iw / ih * self.h)), self.h
+            else:
+                fw, fh = self.w, self.h
+            px = (self.w - fw) // 2
+            py = (self.h - fh) // 2
+            cx = px + nx * fw
+            cy = py + ny * fh
+        else:
+            # ImageOps.fit と同じ中央クロップ
+            if im_ratio > dest_ratio:
+                crop_w, crop_h = ih * dest_ratio, float(ih)
+            else:
+                crop_w, crop_h = float(iw), iw / dest_ratio
+            ox = (iw - crop_w) / 2.0
+            oy = (ih - crop_h) / 2.0
+            cx = (nx * iw - ox) / crop_w * self.w
+            cy = (ny * ih - oy) / crop_h * self.h
+            # クロップで切り落とされた側にある場合は画面内へ寄せる
+            cx = min(max(cx, 0.0), float(self.w))
+            cy = min(max(cy, 0.0), float(self.h))
+
+        return cx, cy
+
+    def subject_motion(self, index: int):
+        """被写体の方向へ寄るためのパン方向を求める。
+
+        完全に中央へ持ってくることは要求しない。ズームで生まれた余白の
+        範囲（従来と同じ ±1.0）へclampするので、画面外は絶対に出ない。
+        """
+        target = self.subject_target_on_canvas(index)
+        if target is None:
+            return None
+        span = self.zoom_end - 1.0
+        if span <= 0:
+            return None  # ズーム0%では寄る余地がない
+
+        cx, cy = target
+        limit_x = span * self.w * 0.34
+        limit_y = span * self.h * 0.34
+        if limit_x <= 0 or limit_y <= 0:
+            return None
+
+        # render_motion の式を逆に解く。被写体が中央へ近づく向きになる。
+        mdx = self.zoom_end * (self.w / 2.0 - cx) / limit_x
+        mdy = self.zoom_end * (self.h / 2.0 - cy) / limit_y
+        mdx = max(-1.0, min(1.0, mdx))
+        mdy = max(-1.0, min(1.0, mdy))
+        if not (np.isfinite(mdx) and np.isfinite(mdy)):
+            return None
+        return Motion(mdx, mdy)
+
     def motions(self) -> list[Motion]:
         # 「完全ランダム」ではなく、上品に見えやすい方向セット。
         dirs = [
@@ -380,6 +529,18 @@ class VideoRenderer:
             d = rnd.choice(choices)
             prev = d
             result.append(Motion(*d))
+
+        # 被写体追従ONで、その写真に被写体が1つだけ見つかっていれば、
+        # パン方向だけを目標方向へ差し替える。
+        # 見つからない・複数ある・解析に失敗した写真は上のランダム方向のまま。
+        if self.camera_mode == CAMERA_SUBJECT and self.detections:
+            for i in range(len(result)):
+                try:
+                    m = self.subject_motion(i)
+                except Exception:
+                    m = None
+                if m is not None:
+                    result[i] = m
         return result
 
     def render_motion(self, base: np.ndarray, motion: Motion, local_frame: int) -> np.ndarray:
@@ -444,6 +605,7 @@ class VideoRenderer:
 
     def render_silent_video(self, temp_video: Path):
         encoder_name, enc_args = self.choose_video_encoder_args()
+        self.encoder_used = encoder_name
         self.q.put(("encoder", encoder_name, self.nvenc_available, self.ffmpeg))
 
         cmd = [
@@ -750,8 +912,96 @@ class VideoRenderer:
         if r.returncode != 0:
             raise RuntimeError("BGM合成失敗:\n" + (r.stderr or "")[-5000:])
 
+    def settings_path(self) -> Path:
+        """作った動画の隣に置く設定ファイルのパス。"""
+        return self.output.with_name(self.output.stem + "_settings.json")
+
+    def write_settings_file(self, encoder_name: str):
+        """スライドショーを作ったときの条件を、動画と同じ場所へ保存する。
+
+        あとから「この動画はどの設定で作ったか」を見返せるようにするため。
+        書き出しに失敗しても動画作成は成功扱いのままにする。
+        """
+        names = [p.name for p in self.images]
+        data = {
+            "app": APP_NAME,
+            "saved_at": datetime.now().isoformat(timespec="seconds"),
+            "output": str(self.output),
+            "photos": {
+                "count": len(self.images),
+                "folder": str(self.images[0].parent) if self.images else "",
+                "first": names[0] if names else "",
+                "last": names[-1] if names else "",
+            },
+            "video": {
+                "width": self.w,
+                "height": self.h,
+                "fps": self.fps,
+                "interval_seconds": self.interval,
+                "transition_seconds": self.transition,
+                "zoom_percent": round((self.zoom_end - 1.0) * 100.0, 4),
+                "blur_background": self.blur_background,
+                "camera_mode": self.camera_mode,
+                "encoder_choice": self.encoder_pref,
+                "encoder_used": encoder_name,
+                "nvenc_detected": self.nvenc_available,
+                "total_frames": self.total_frames,
+                "total_duration_seconds": self.total_duration,
+            },
+            "title_card": (asdict(self.title) if self.title else {"enabled": False}),
+            "bgm_timing": asdict(self.bgm_timing),
+            "bgm_segments": [
+                {
+                    "start_photo": s_.start_index + 1,
+                    "end_photo": s_.end_index + 1,
+                    "start_file": names[s_.start_index] if s_.start_index < len(names) else "",
+                    "end_file": names[s_.end_index] if s_.end_index < len(names) else "",
+                    "audio": str(s_.audio_path),
+                }
+                for s_ in sorted(self.bgm_segments, key=lambda x: x.start_index)
+            ],
+        }
+
+        if self.camera_mode == CAMERA_SUBJECT:
+            counts: dict[str, int] = {}
+            for det in self.detections.values():
+                counts[det.mode] = counts.get(det.mode, 0) + 1
+            data["subject_camera"] = {
+                "analyzed": len(self.detections),
+                "by_mode": counts,
+                "photos": [
+                    {
+                        "photo": i + 1,
+                        "file": self.detections[i].filename,
+                        "face_count": self.detections[i].face_count,
+                        "dog_count": self.detections[i].dog_count,
+                        "mode": self.detections[i].mode,
+                        "target_x": self.detections[i].target_x,
+                        "target_y": self.detections[i].target_y,
+                    }
+                    for i in sorted(self.detections)
+                ],
+            }
+
+        data.update(self.settings_extra)
+
+        try:
+            self.settings_path().write_text(
+                json.dumps(data, ensure_ascii=False, indent=2) + chr(10),
+                encoding="utf-8",
+            )
+        except Exception as e:
+            self.q.put(("warning",
+                        "動画はできましたが、設定ファイルを保存できませんでした。" + chr(10)
+                        + f"{type(e).__name__}: {e}"))
+
     def run(self):
         self.output.parent.mkdir(parents=True, exist_ok=True)
+
+        if self.camera_mode == CAMERA_SUBJECT:
+            self.analyze_subjects()
+            if self.stop_event.is_set():
+                raise InterruptedError("処理を中止しました。")
 
         with tempfile.TemporaryDirectory(prefix="photomovie_") as td:
             temp_video = Path(td) / "video_only.mp4"
@@ -762,6 +1012,7 @@ class VideoRenderer:
 
             self.mux_bgm(temp_video)
 
+        self.write_settings_file(self.encoder_used)
         self.q.put(("progress", 100.0))
         self.q.put(("done", str(self.output)))
 
@@ -868,6 +1119,8 @@ class App(tk.Tk):
         self.resolution_var = tk.StringVar(value="1920x1080")
         self.fps_var = tk.IntVar(value=30)
         self.encoder_var = tk.StringVar(value="自動")
+        # カメラワーク。既定は従来方式。
+        self.camera_var = tk.StringVar(value=CAMERA_LEGACY)
 
         # タイトルカード
         self.title_on_var = tk.BooleanVar(value=True)
@@ -960,6 +1213,20 @@ class App(tk.Tk):
             text="縦写真も切らずに見せる（ぼかし背景 + 写真全体表示）",
             variable=self.blur_var,
         ).pack(anchor="w", pady=(7, 0))
+
+        cam = ttk.Frame(settings)
+        cam.pack(fill="x", pady=(8, 0))
+        ttk.Label(cam, text="カメラワーク").pack(side="left", padx=(0, 10))
+        ttk.Radiobutton(
+            cam, text="従来方式", value=CAMERA_LEGACY,
+            variable=self.camera_var, command=self.on_camera_mode_change,
+        ).pack(side="left")
+        ttk.Radiobutton(
+            cam, text="被写体追従（人物・犬）［実験機能］", value=CAMERA_SUBJECT,
+            variable=self.camera_var, command=self.on_camera_mode_change,
+        ).pack(side="left", padx=(14, 0))
+        self.camera_note = ttk.Label(cam, text="")
+        self.camera_note.pack(side="left", padx=(14, 0))
 
         title = ttk.LabelFrame(root, text="タイトルカード", padding=10)
         title.pack(fill="x", pady=(10, 0))
@@ -1163,6 +1430,36 @@ class App(tk.Tk):
                 values=(start, end, s.audio_path.name)
             )
 
+    def subject_models_missing(self) -> list[str]:
+        """モデルファイルの有無だけを見る。重い読み込みはここではしない。"""
+        if subject_detector is None:
+            return ["subject_detector.py"]
+        d = Path(__file__).resolve().parent / subject_detector.MODELS_DIR_NAME
+        return [
+            name for name in (subject_detector.FACE_MODEL_FILE,
+                              subject_detector.DOG_MODEL_FILE)
+            if not (d / name).is_file()
+        ]
+
+    def on_camera_mode_change(self):
+        if self.camera_var.get() != CAMERA_SUBJECT:
+            self.camera_note.config(text="")
+            return
+        missing = self.subject_models_missing()
+        if missing:
+            self.camera_note.config(text="モデルが見つかりません")
+            messagebox.showwarning(
+                APP_NAME,
+                "人物・犬検出モデルが見つかりません。" + chr(10)
+                + "次のファイルを models フォルダーへ置いてください:" + chr(10)
+                + chr(10).join("  " + m for m in missing) + chr(10) + chr(10)
+                + "従来カメラワークはそのまま使用できます。",
+            )
+            self.camera_var.set(CAMERA_LEGACY)
+            return
+        self.camera_note.config(
+            text="写真ごとに被写体を1回だけ解析します（PC内で完結）")
+
     def title_card(self) -> TitleCard:
         return TitleCard(
             enabled=bool(self.title_on_var.get()),
@@ -1254,6 +1551,17 @@ class App(tk.Tk):
             stop_event=self.stop_event,
             title=self.title_card(),
             bgm_timing=self.bgm_timing(),
+            camera_mode=self.camera_var.get(),
+            settings_extra={
+                "gui": {
+                    "photo_folder": self.folder_var.get(),
+                    "encoder_label": self.encoder_var.get(),
+                    "resolution_label": self.resolution_var.get(),
+                    "camera_label": ("被写体追従（人物・犬）"
+                                     if self.camera_var.get() == CAMERA_SUBJECT
+                                     else "従来方式"),
+                }
+            },
         )
 
         def work():
@@ -1293,7 +1601,19 @@ class App(tk.Tk):
                     self.start_btn.config(state="normal")
                     self.cancel_btn.config(state="disabled")
                     self.status.config(text="完成しました。")
-                    messagebox.showinfo(APP_NAME, f"完成しました。\n\n{item[1]}")
+                    settings = Path(item[1]).with_name(
+                        Path(item[1]).stem + "_settings.json")
+                    extra = ("" if not settings.is_file() else
+                             chr(10) + chr(10) + "このときの設定も保存しました:"
+                             + chr(10) + settings.name)
+                    messagebox.showinfo(
+                        APP_NAME,
+                        "完成しました。" + chr(10) + chr(10) + item[1] + extra)
+
+                elif kind == "warning":
+                    # 被写体追従が使えない等。動画作成は従来方式で続行する。
+                    self.status.config(text=item[1].splitlines()[0])
+                    messagebox.showwarning(APP_NAME, item[1])
 
                 elif kind == "cancelled":
                     self.start_btn.config(state="normal")
