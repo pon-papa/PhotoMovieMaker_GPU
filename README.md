@@ -2,9 +2,9 @@
 
 Windows 11 で、写真フォルダーから記念映像（MP4）を作る小型GUIアプリです。
 
-バージョン: v0.1（初版）
+バージョン: v0.1.0（初版）
 
-## 初版仕様
+## v0.1.0 の仕様
 
 - 動画の先頭に**タイトルカード**を自動生成（アプリ内部で作るので、写真フォルダーは汚しません）
 - 画像をファイル名の自然順で並べる
@@ -64,7 +64,7 @@ A2000のNVENCが検出されれば映像圧縮はGPU側で行います。
 ```
 pillow>=10.0
 numpy>=1.26
-opencv-python>=4.9
+opencv-python>=4.9,<6
 imageio-ffmpeg>=0.5
 ```
 
@@ -265,7 +265,8 @@ MIT License — [LICENSE](LICENSE) を参照してください。
 
 同梱・利用している第三者の成果物（検出モデル、Pythonパッケージ、FFmpeg）の
 ライセンスは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にまとめてあります。
-検出モデルは YuNet が MIT、YOLOX が Apache-2.0 です。
+検出モデルは YuNet が MIT、YOLOX が Apache-2.0 で、
+それぞれのライセンス本文を [licenses/](licenses/) に同梱しています。
 
 ## 次の改良候補
 
