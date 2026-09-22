@@ -1,0 +1,9 @@
+# Windows環境で改行の差分が出ないようにするための最小限の指定。
+* text=auto
+
+*.py  text eol=lf
+*.md  text eol=lf
+*.txt text eol=lf
+*.bat text eol=crlf
+
+*.zip binary

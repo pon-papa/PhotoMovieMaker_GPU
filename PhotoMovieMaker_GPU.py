@@ -19,9 +19,6 @@ from __future__ import annotations
 
 import os
 import re
-import sys
-import math
-import time
 import random
 import shutil
 import tempfile
@@ -332,7 +329,11 @@ class VideoRenderer:
                         and local >= self.interval_frames - self.transition_frames
                     ):
                         k = local - (self.interval_frames - self.transition_frames)
-                        next_local = k
+                        # 次写真の時間軸は「自分の区間の先頭」が0。
+                        # クロスフェード中はその手前なので負の値になる。
+                        # ここを k のままにすると、次写真が先に動き出してから
+                        # 区間開始時に local=0 へ巻き戻り、境界で画が飛ぶ。
+                        next_local = k - self.transition_frames
                         nxt = self.render_motion(next_canvas, motions[i + 1], next_local)
                         a = smoothstep((k + 1) / self.transition_frames)
                         frame = cv2.addWeighted(frame, 1.0 - a, nxt, a, 0.0)
@@ -405,22 +406,45 @@ class VideoRenderer:
         filters = []
         labels = []
 
+        # 境界を共有する2区間では、前曲のフェードアウトと次曲のフェードインを
+        # 同じ長さ（短い方）に揃える。
+        # 長さが違うと、片方が満音量のまま他方が鳴り始める時間ができてしまい、
+        # 音量が最大1.75倍に膨らんだり、逆に-12dBの谷ができる。
+        # 揃えると境界のゲイン合計は常に1.0になる。
+        fade_in_lengths = []
+        fade_out_lengths = []
+        for i, seg in enumerate(segs):
+            own = max(0.0, seg.fade_seconds)
+            prev_adjacent = i > 0 and seg.start_index == segs[i - 1].end_index + 1
+            next_adjacent = i + 1 < len(segs) and segs[i + 1].start_index == seg.end_index + 1
+            fade_in_lengths.append(
+                min(own, max(0.0, segs[i - 1].fade_seconds)) if prev_adjacent else own
+            )
+            fade_out_lengths.append(
+                min(own, max(0.0, segs[i + 1].fade_seconds)) if next_adjacent else own
+            )
+
         for idx, s in enumerate(segs, start=1):
             nominal_start = s.start_index * self.interval
 
             # 「終了画像の次の8秒境界」まで担当
             nominal_end = min((s.end_index + 1) * self.interval, self.total_duration)
 
-            fade = max(0.0, min(s.fade_seconds, (nominal_end - nominal_start) / 2.0))
+            half = (nominal_end - nominal_start) / 2.0
+            fade_in_len = max(0.0, min(fade_in_lengths[idx - 1], half))
+            fade_out_len = max(0.0, min(fade_out_lengths[idx - 1], half))
 
             # 次曲は境界の fade 秒前からフェードインして受け渡す。
             # 先頭曲は0秒から。途中曲は少し先行開始。
-            actual_start = nominal_start if s.start_index == 0 else max(0.0, nominal_start - fade)
+            actual_start = (
+                nominal_start if s.start_index == 0
+                else max(0.0, nominal_start - fade_in_len)
+            )
             actual_end = nominal_end
 
             duration = max(0.05, actual_end - actual_start)
-            fade_in = 0.0 if actual_start == 0.0 else min(fade, duration / 2.0)
-            fade_out = min(fade, duration / 2.0)
+            fade_in = 0.0 if actual_start == 0.0 else min(fade_in_len, duration / 2.0)
+            fade_out = min(fade_out_len, duration / 2.0)
 
             chain = (
                 f"[{idx}:a]"
