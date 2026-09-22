@@ -34,7 +34,7 @@ from tkinter import ttk, filedialog, messagebox
 
 import cv2
 import numpy as np
-from PIL import Image, ImageOps, ImageFilter
+from PIL import Image, ImageOps, ImageFilter, ImageDraw, ImageFont, ImageColor
 
 try:
     import imageio_ffmpeg
@@ -48,6 +48,88 @@ AUDIO_FILETYPES = [
     ("Audio", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
     ("All files", "*.*"),
 ]
+
+# タイトルカード用フォント。日本語glyphを持つものを先に試す。
+TITLE_FONT_CANDIDATES = [
+    "YuGothM.ttc",    # 游ゴシック Medium
+    "YuGothR.ttc",    # 游ゴシック Regular
+    "meiryo.ttc",     # メイリオ
+    "YuGothB.ttc",    # 游ゴシック Bold
+    "msgothic.ttc",   # MS ゴシック
+    "segoeui.ttf",    # Segoe UI（欧文のみ）
+    "arial.ttf",
+]
+
+_font_cache: dict = {}
+
+
+def _font_dirs() -> list[Path]:
+    dirs = []
+    win = os.environ.get("WINDIR") or r"C:\Windows"
+    dirs.append(Path(win) / "Fonts")
+    local = os.environ.get("LOCALAPPDATA")
+    if local:
+        # ユーザー単位でインストールされたフォント
+        dirs.append(Path(local) / "Microsoft" / "Windows" / "Fonts")
+    return [d for d in dirs if d.is_dir()]
+
+
+def _draws_glyphs(font, text: str) -> bool:
+    """文字が「豆腐」(.notdef)にならずに描けるか確認する。"""
+    try:
+        size = max(8, getattr(font, "size", 16))
+        def probe(ch: str) -> bytes:
+            im = Image.new("L", (size * 3, size * 3), 0)
+            ImageDraw.Draw(im).text((size // 2, size // 2), ch, font=font, fill=255)
+            return im.tobytes()
+        notdef = probe(chr(0xFFFF))  # 非文字。どのフォントにも無いので必ず .notdef になる
+        for ch in set(text):
+            if ch.isspace():
+                continue
+            if probe(ch) == notdef:
+                return False
+        return True
+    except Exception:
+        return True
+
+
+def load_title_font(size: int, text: str):
+    """Windows 11上で text を描けるフォントを安全に探す。
+    見つからなければ Pillow 既定フォントへフォールバックし、例外は投げない。"""
+    key = (size, "".join(sorted(set(text))))
+    if key in _font_cache:
+        return _font_cache[key]
+
+    dirs = _font_dirs()
+    for name in TITLE_FONT_CANDIDATES:
+        for d in dirs:
+            path = d / name
+            if not path.is_file():
+                continue
+            try:
+                font = ImageFont.truetype(str(path), size)
+            except Exception:
+                continue
+            if _draws_glyphs(font, text):
+                _font_cache[key] = font
+                return font
+
+    # どれも見つからない/描けない場合でもクラッシュさせない
+    try:
+        font = ImageFont.load_default(size)
+    except Exception:
+        font = ImageFont.load_default()
+    _font_cache[key] = font
+    return font
+
+
+def parse_color(value: str, fallback: str) -> str:
+    """"#FFFFFF" 等のHEX文字列を検証する。不正なら fallback を返す。"""
+    try:
+        ImageColor.getrgb(value.strip())
+        return value.strip()
+    except Exception:
+        return fallback
 
 # Dual Xeon環境ではOpenCV内部の並列化も使う。
 try:
@@ -103,7 +185,30 @@ class BGMSegment:
     start_index: int  # 0-based
     end_index: int    # 0-based, inclusive
     audio_path: Path
-    fade_seconds: float = 2.5
+
+
+@dataclass
+class TitleCard:
+    """動画冒頭のタイトル区間。写真リストには含めない。"""
+    enabled: bool = True
+    main: str = ""
+    sub: str = ""
+    date: str = ""
+    duration: float = 5.0        # タイトルを見せる秒数
+    fade_seconds: float = 1.0    # タイトル→写真1 のクロスフェード
+    bg_color: str = "#FFFFFF"
+    fg_color: str = "#333333"
+
+
+@dataclass
+class BGMTiming:
+    """BGM全体の入り方・つなぎ方・終わり方。区間ごとではなく全体で1組持つ。"""
+    first_offset: float = 0.5     # 動画開始から最初のBGMが鳴り出すまで
+    first_fade_in: float = 1.5    # 冒頭のフェードイン
+    fade_out: float = 1.5         # 曲の終わりのフェードアウト
+    silence_gap: float = 0.7      # 曲と曲の間の無音
+    fade_in: float = 1.5          # 次の曲のフェードイン
+    final_fade_out: float = 3.0   # 最後の曲を動画末尾で消すまで
 
 
 @dataclass
@@ -128,6 +233,8 @@ class VideoRenderer:
         encoder_pref: str,
         q: Queue,
         stop_event: threading.Event,
+        title: "TitleCard | None" = None,
+        bgm_timing: "BGMTiming | None" = None,
     ):
         self.images = image_paths
         self.output = output_path
@@ -143,11 +250,30 @@ class VideoRenderer:
         self.q = q
         self.stop_event = stop_event
 
+        self.title = title if (title and title.enabled) else None
+        self.bgm_timing = bgm_timing or BGMTiming()
+
         self.interval_frames = max(1, round(self.interval * self.fps))
         self.transition_frames = max(0, round(self.transition * self.fps))
+
+        # タイトルカードは「写真0」ではなく独立した区間。
+        # self.images には一切入れないので、写真番号はタイトル有無で変わらない。
+        if self.title:
+            self.title_frames = max(1, round(self.title.duration * self.fps))
+            self.title_fade_frames = min(
+                max(0, round(self.title.fade_seconds * self.fps)),
+                self.title_frames,
+            )
+        else:
+            self.title_frames = 0
+            self.title_fade_frames = 0
+
         # 最終写真も interval 秒見せる
-        self.total_frames = len(self.images) * self.interval_frames
+        self.total_frames = self.title_frames + len(self.images) * self.interval_frames
         self.total_duration = self.total_frames / self.fps
+        # 音声側はフレーム数から逆算した値を使い、映像と必ず一致させる
+        self.title_duration = self.title_frames / self.fps
+        self.photo_span = self.interval_frames / self.fps
 
         self.ffmpeg = find_ffmpeg()
         self.nvenc_available = ffmpeg_has_nvenc(self.ffmpeg)
@@ -181,6 +307,43 @@ class VideoRenderer:
                 )
 
         return np.asarray(canvas, dtype=np.uint8)
+
+    def render_title_canvas(self) -> np.ndarray:
+        """タイトルカードを1枚の静止画として作る。
+        パン・ズーム・warpAffine は一切かけない。"""
+        t = self.title
+        img = Image.new("RGB", (self.w, self.h), t.bg_color)
+        draw = ImageDraw.Draw(img)
+
+        # 画面高さに対する比率で決めるので 1080p でも 4K でも同じ見え方になる
+        rows = [
+            (t.main, 0.070),
+            (t.sub, 0.035),
+            (t.date, 0.030),
+        ]
+        rows = [(text.strip(), ratio) for text, ratio in rows if text and text.strip()]
+        if not rows:
+            return np.asarray(img, dtype=np.uint8)
+
+        laid_out = []
+        for text, ratio in rows:
+            font = load_title_font(max(12, int(self.h * ratio)), text)
+            box = draw.textbbox((0, 0), text, font=font)
+            laid_out.append((text, font, box))
+
+        line_gap = int(self.h * 0.035)
+        block_h = sum(b[3] - b[1] for _, _, b in laid_out) + line_gap * (len(laid_out) - 1)
+        y = (self.h - block_h) // 2
+
+        for text, font, box in laid_out:
+            text_w = box[2] - box[0]
+            draw.text(
+                ((self.w - text_w) // 2 - box[0], y - box[1]),
+                text, font=font, fill=t.fg_color,
+            )
+            y += (box[3] - box[1]) + line_gap
+
+        return np.ascontiguousarray(np.asarray(img, dtype=np.uint8))
 
     def motions(self) -> list[Motion]:
         # 「完全ランダム」ではなく、上品に見えやすい方向セット。
@@ -300,7 +463,39 @@ class VideoRenderer:
 
         frame_no = 0
 
+        def emit(frame: np.ndarray):
+            nonlocal frame_no
+            proc.stdin.write(frame.tobytes())
+            frame_no += 1
+            # UI更新は毎フレーム行わない
+            if frame_no % max(1, self.fps // 2) == 0:
+                self.q.put(("progress", 100.0 * frame_no / self.total_frames))
+
         try:
+            if self.title_frames:
+                self.q.put(("status", "タイトルカードを作成中…"))
+                title_canvas = self.render_title_canvas()
+
+                for local in range(self.title_frames):
+                    if self.stop_event.is_set():
+                        raise InterruptedError("処理を中止しました。")
+
+                    frame = title_canvas
+                    # タイトル区間の最後で写真1へクロスフェードする。
+                    # 写真1の時間軸は「写真1の区間開始」が0なので、ここでは負の値。
+                    # これにより動画全体が余計に伸びず、写真1の動きも途切れない。
+                    if self.title_fade_frames > 0 and (
+                        local >= self.title_frames - self.title_fade_frames
+                    ):
+                        k = local - (self.title_frames - self.title_fade_frames)
+                        nxt = self.render_motion(
+                            current, motions[0], k - self.title_fade_frames
+                        )
+                        a = smoothstep((k + 1) / self.title_fade_frames)
+                        frame = cv2.addWeighted(title_canvas, 1.0 - a, nxt, a, 0.0)
+
+                    emit(frame)
+
             for i, path in enumerate(self.images):
                 if self.stop_event.is_set():
                     raise InterruptedError("処理を中止しました。")
@@ -338,13 +533,7 @@ class VideoRenderer:
                         a = smoothstep((k + 1) / self.transition_frames)
                         frame = cv2.addWeighted(frame, 1.0 - a, nxt, a, 0.0)
 
-                    proc.stdin.write(frame.tobytes())
-                    frame_no += 1
-
-                    # UI更新は毎フレーム行わない
-                    if frame_no % max(1, self.fps // 2) == 0:
-                        pct = 100.0 * frame_no / self.total_frames
-                        self.q.put(("progress", pct))
+                    emit(frame)
 
             proc.stdin.close()
             proc.stdin = None
@@ -361,6 +550,15 @@ class VideoRenderer:
                 pass
             try:
                 proc.kill()
+                # Windowsのkillは非同期なので、終了を待たずに抜けると
+                # FFmpegが一時ファイルを掴んだままになり、
+                # TemporaryDirectoryの後始末がWinError 32で失敗する。
+                proc.wait(timeout=15)
+            except Exception:
+                pass
+            try:
+                if proc.stderr:
+                    proc.stderr.close()
             except Exception:
                 pass
             raise
@@ -383,6 +581,65 @@ class VideoRenderer:
                 )
         return segs
 
+    def bgm_plan(self, segs: list[BGMSegment]):
+        """各BGM区間を実時間へ割り付ける。
+
+        方式は「前曲フェードアウト → 無音 → 次曲フェードイン」。
+        2曲を重ねないので、境界での音量加算もクリッピングも起きない。
+
+        戻り値: [(開始秒, 長さ秒, フェードイン秒, フェードアウト秒), ...]
+        """
+        t = self.bgm_timing
+        MIN_AUDIO = 0.05  # これ以下には縮めない
+        plan = []
+
+        for i, s_ in enumerate(segs):
+            # 写真番号はタイトルの有無で変わらない。タイトルぶんは時間軸だけずらす。
+            nominal_start = self.title_duration + s_.start_index * self.photo_span
+            nominal_end = min(
+                self.title_duration + (s_.end_index + 1) * self.photo_span,
+                self.total_duration,
+            )
+            span = max(0.0, nominal_end - nominal_start)
+
+            is_opening = (s_.start_index == 0)
+            prev_adjacent = i > 0 and s_.start_index == segs[i - 1].end_index + 1
+            is_last = (i == len(segs) - 1)
+            reaches_end = nominal_end >= self.total_duration - 1e-6
+
+            if is_opening:
+                # 写真1から始まる曲だけ、タイトルカード中から先行して鳴らす。
+                actual_start = min(
+                    max(0.0, t.first_offset),
+                    max(0.0, nominal_end - MIN_AUDIO),
+                )
+                fade_in = max(0.0, t.first_fade_in)
+            else:
+                # 直前の区間と連続しているときだけ無音を挟む。
+                # 写真が飛んでいる場合はもともと無音なので gap は不要。
+                gap = max(0.0, t.silence_gap) if prev_adjacent else 0.0
+                gap = min(gap, max(0.0, span - MIN_AUDIO))
+                actual_start = nominal_start + gap
+                fade_in = max(0.0, t.fade_in)
+
+            # 最後の曲が動画の最後まで担当しているときだけ最終フェードアウト。
+            # 途中で終わる場合はその区間の末尾で消して、以後は無音のまま。
+            fade_out = max(0.0, t.final_fade_out if (is_last and reaches_end)
+                           else t.fade_out)
+
+            duration = max(MIN_AUDIO, nominal_end - actual_start)
+
+            # 区間が短いとフェードが入りきらないので按分して縮める。
+            # （短い区間でも負の開始時刻や次境界越えを起こさないため）
+            if fade_in + fade_out > duration:
+                scale = duration / (fade_in + fade_out)
+                fade_in *= scale
+                fade_out *= scale
+
+            plan.append((actual_start, duration, fade_in, fade_out))
+
+        return plan
+
     def mux_bgm(self, silent_video: Path):
         segs = self.validate_bgm_segments()
 
@@ -393,6 +650,8 @@ class VideoRenderer:
             shutil.move(str(silent_video), str(self.output))
             return
 
+        plan = self.bgm_plan(segs)
+
         cmd = [
             self.ffmpeg, "-y",
             "-hide_banner", "-loglevel", "error",
@@ -400,52 +659,13 @@ class VideoRenderer:
         ]
 
         # 各BGMは短ければ自動ループ
-        for s in segs:
-            cmd += ["-stream_loop", "-1", "-i", str(s.audio_path)]
+        for s_ in segs:
+            cmd += ["-stream_loop", "-1", "-i", str(s_.audio_path)]
 
         filters = []
         labels = []
 
-        # 境界を共有する2区間では、前曲のフェードアウトと次曲のフェードインを
-        # 同じ長さ（短い方）に揃える。
-        # 長さが違うと、片方が満音量のまま他方が鳴り始める時間ができてしまい、
-        # 音量が最大1.75倍に膨らんだり、逆に-12dBの谷ができる。
-        # 揃えると境界のゲイン合計は常に1.0になる。
-        fade_in_lengths = []
-        fade_out_lengths = []
-        for i, seg in enumerate(segs):
-            own = max(0.0, seg.fade_seconds)
-            prev_adjacent = i > 0 and seg.start_index == segs[i - 1].end_index + 1
-            next_adjacent = i + 1 < len(segs) and segs[i + 1].start_index == seg.end_index + 1
-            fade_in_lengths.append(
-                min(own, max(0.0, segs[i - 1].fade_seconds)) if prev_adjacent else own
-            )
-            fade_out_lengths.append(
-                min(own, max(0.0, segs[i + 1].fade_seconds)) if next_adjacent else own
-            )
-
-        for idx, s in enumerate(segs, start=1):
-            nominal_start = s.start_index * self.interval
-
-            # 「終了画像の次の8秒境界」まで担当
-            nominal_end = min((s.end_index + 1) * self.interval, self.total_duration)
-
-            half = (nominal_end - nominal_start) / 2.0
-            fade_in_len = max(0.0, min(fade_in_lengths[idx - 1], half))
-            fade_out_len = max(0.0, min(fade_out_lengths[idx - 1], half))
-
-            # 次曲は境界の fade 秒前からフェードインして受け渡す。
-            # 先頭曲は0秒から。途中曲は少し先行開始。
-            actual_start = (
-                nominal_start if s.start_index == 0
-                else max(0.0, nominal_start - fade_in_len)
-            )
-            actual_end = nominal_end
-
-            duration = max(0.05, actual_end - actual_start)
-            fade_in = 0.0 if actual_start == 0.0 else min(fade_in_len, duration / 2.0)
-            fade_out = min(fade_out_len, duration / 2.0)
-
+        for idx, (start, duration, fade_in, fade_out) in enumerate(plan, start=1):
             chain = (
                 f"[{idx}:a]"
                 f"atrim=duration={duration:.6f},"
@@ -462,7 +682,7 @@ class VideoRenderer:
                     f"d={fade_out:.6f},"
                 )
 
-            delay_ms = int(round(actual_start * 1000))
+            delay_ms = int(round(start * 1000))
             chain += f"adelay={delay_ms}|{delay_ms}[a{idx}]"
 
             filters.append(chain)
@@ -472,6 +692,7 @@ class VideoRenderer:
             # 1曲だけでも全体長へ揃える
             filters.append(f"{labels[0]}apad,atrim=duration={self.total_duration:.6f}[mix]")
         else:
+            # 時間上は重ならない設計なので amix は「並べる」だけの役割。
             filters.append(
                 "".join(labels)
                 + f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
@@ -530,13 +751,11 @@ class BGMDialog(tk.Toplevel):
         self.start_var = tk.StringVar()
         self.end_var = tk.StringVar()
         self.audio_var = tk.StringVar()
-        self.fade_var = tk.DoubleVar(value=2.5)
 
         if initial:
             self.start_var.set(image_names[initial.start_index])
             self.end_var.set(image_names[initial.end_index])
             self.audio_var.set(str(initial.audio_path))
-            self.fade_var.set(initial.fade_seconds)
         elif image_names:
             self.start_var.set(image_names[0])
             self.end_var.set(image_names[-1])
@@ -560,20 +779,17 @@ class BGMDialog(tk.Toplevel):
         ttk.Entry(frm, textvariable=self.audio_var, width=45).grid(row=2, column=1, sticky="ew", pady=5)
         ttk.Button(frm, text="選択", command=self.pick_audio).grid(row=2, column=2, padx=(6, 0), pady=5)
 
-        ttk.Label(frm, text="曲間フェード").grid(row=3, column=0, sticky="w", pady=5)
-        ttk.Spinbox(frm, from_=0, to=10, increment=0.5, textvariable=self.fade_var, width=8).grid(
-            row=3, column=1, sticky="w", pady=5
-        )
-        ttk.Label(frm, text="秒").grid(row=3, column=1, sticky="w", padx=(76, 0))
-
         note = (
-            "次の曲は、指定区間の開始時刻より少し前からフェードインし、\n"
-            "前の曲がフェードアウトしながら自然に受け渡します。"
+            "曲の入り方・つなぎ方・終わり方は「BGM全体設定」でまとめて指定します。\n"
+            "区間の境目では、前の曲がフェードアウトして完全に消えてから、\n"
+            "短い無音をはさんで次の曲がフェードインします。"
         )
-        ttk.Label(frm, text=note).grid(row=4, column=0, columnspan=3, sticky="w", pady=(8, 10))
+        ttk.Label(frm, text=note, justify="left").grid(
+            row=3, column=0, columnspan=3, sticky="w", pady=(10, 10)
+        )
 
         buttons = ttk.Frame(frm)
-        buttons.grid(row=5, column=0, columnspan=3, sticky="e")
+        buttons.grid(row=4, column=0, columnspan=3, sticky="e")
         ttk.Button(buttons, text="キャンセル", command=self.destroy).pack(side="right")
         ttk.Button(buttons, text="OK", command=self.ok).pack(side="right", padx=(0, 8))
 
@@ -602,9 +818,7 @@ class BGMDialog(tk.Toplevel):
             messagebox.showerror("BGM区間", "終了画像は開始画像以降にしてください。", parent=self)
             return
 
-        self.result = BGMSegment(
-            si, ei, Path(self.audio_var.get()), float(self.fade_var.get())
-        )
+        self.result = BGMSegment(si, ei, Path(self.audio_var.get()))
         self.destroy()
 
 
@@ -612,8 +826,8 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("980x760")
-        self.minsize(900, 700)
+        self.geometry("1020x980")
+        self.minsize(960, 820)
 
         self.q = Queue()
         self.stop_event = threading.Event()
@@ -628,6 +842,24 @@ class App(tk.Tk):
         self.resolution_var = tk.StringVar(value="1920x1080")
         self.fps_var = tk.IntVar(value=30)
         self.encoder_var = tk.StringVar(value="自動")
+
+        # タイトルカード
+        self.title_on_var = tk.BooleanVar(value=True)
+        self.title_main_var = tk.StringVar()
+        self.title_sub_var = tk.StringVar()
+        self.title_date_var = tk.StringVar()
+        self.title_dur_var = tk.DoubleVar(value=5.0)
+        self.title_fade_var = tk.DoubleVar(value=1.0)
+        self.title_bg_var = tk.StringVar(value="#FFFFFF")
+        self.title_fg_var = tk.StringVar(value="#333333")
+
+        # BGM全体設定（曲ごとではなく全体で1組）
+        self.bgm_offset_var = tk.DoubleVar(value=0.5)
+        self.bgm_first_fade_var = tk.DoubleVar(value=1.5)
+        self.bgm_fadeout_var = tk.DoubleVar(value=1.5)
+        self.bgm_gap_var = tk.DoubleVar(value=0.7)
+        self.bgm_fadein_var = tk.DoubleVar(value=1.5)
+        self.bgm_final_var = tk.DoubleVar(value=3.0)
 
         self.images: list[Path] = []
         self.bgm_segments: list[BGMSegment] = []
@@ -702,8 +934,61 @@ class App(tk.Tk):
             variable=self.blur_var,
         ).pack(anchor="w", pady=(7, 0))
 
-        bgm = ttk.LabelFrame(root, text="BGM区間指定", padding=10)
+        title = ttk.LabelFrame(root, text="タイトルカード", padding=10)
+        title.pack(fill="x", pady=(10, 0))
+
+        ttk.Checkbutton(
+            title, text="タイトルカードを入れる（動画の先頭に表示します。写真の枚数・番号は変わりません）",
+            variable=self.title_on_var,
+        ).grid(row=0, column=0, columnspan=6, sticky="w", pady=(0, 6))
+
+        for row, (label, var) in enumerate((
+            ("タイトル", self.title_main_var),
+            ("サブタイトル", self.title_sub_var),
+            ("日付・補助文字", self.title_date_var),
+        ), start=1):
+            ttk.Label(title, text=label, width=14).grid(row=row, column=0, sticky="w", pady=3)
+            ttk.Entry(title, textvariable=var).grid(
+                row=row, column=1, columnspan=5, sticky="ew", pady=3
+            )
+
+        ttk.Label(title, text="表示時間").grid(row=4, column=0, sticky="w", pady=(6, 0))
+        ttk.Spinbox(title, from_=1, to=30, increment=0.5, textvariable=self.title_dur_var,
+                    width=7).grid(row=4, column=1, sticky="w", pady=(6, 0))
+        ttk.Label(title, text="秒　　タイトル→写真フェード").grid(
+            row=4, column=2, sticky="w", pady=(6, 0))
+        ttk.Spinbox(title, from_=0, to=5, increment=0.1, textvariable=self.title_fade_var,
+                    width=7).grid(row=4, column=3, sticky="w", pady=(6, 0))
+        ttk.Label(title, text="秒　　背景色").grid(row=4, column=4, sticky="e", pady=(6, 0))
+        ttk.Entry(title, textvariable=self.title_bg_var, width=10).grid(
+            row=4, column=5, sticky="w", pady=(6, 0))
+        ttk.Label(title, text="文字色").grid(row=5, column=4, sticky="e", pady=(3, 0))
+        ttk.Entry(title, textvariable=self.title_fg_var, width=10).grid(
+            row=5, column=5, sticky="w", pady=(3, 0))
+        title.columnconfigure(1, weight=1)
+
+        bgm = ttk.LabelFrame(root, text="BGM", padding=10)
         bgm.pack(fill="both", expand=True, pady=(10, 0))
+
+        timing = ttk.Frame(bgm)
+        timing.pack(fill="x", pady=(0, 8))
+        ttk.Label(timing, text="全体設定（曲の入り方・つなぎ方・終わり方）").grid(
+            row=0, column=0, columnspan=6, sticky="w", pady=(0, 4))
+        for col, (label, var) in enumerate((
+            ("冒頭オフセット", self.bgm_offset_var),
+            ("冒頭フェードイン", self.bgm_first_fade_var),
+            ("曲間フェードアウト", self.bgm_fadeout_var),
+            ("曲間無音", self.bgm_gap_var),
+            ("曲間フェードイン", self.bgm_fadein_var),
+            ("最終フェードアウト", self.bgm_final_var),
+        )):
+            r_, c_ = divmod(col, 3)
+            cell = ttk.Frame(timing)
+            cell.grid(row=1 + r_, column=c_, sticky="w", padx=(0, 24), pady=2)
+            ttk.Label(cell, text=label, width=17).pack(side="left")
+            ttk.Spinbox(cell, from_=0, to=10, increment=0.1, textvariable=var,
+                        width=7).pack(side="left")
+            ttk.Label(cell, text="秒").pack(side="left", padx=(3, 0))
 
         toolbar = ttk.Frame(bgm)
         toolbar.pack(fill="x", pady=(0, 6))
@@ -712,19 +997,17 @@ class App(tk.Tk):
         ttk.Button(toolbar, text="選択区間を削除", command=self.delete_bgm).pack(side="left")
         ttk.Label(
             toolbar,
-            text="例：001.jpg～032.jpg = 曲A / 033.jpg～068.jpg = 曲B",
+            text="例：001.jpg～032.jpg = 曲A / 033.jpg～068.jpg = 曲B（区間の指定が無い写真は無音）",
         ).pack(side="right")
 
-        columns = ("start", "end", "music", "fade")
-        self.tree = ttk.Treeview(bgm, columns=columns, show="headings", height=8)
+        columns = ("start", "end", "music")
+        self.tree = ttk.Treeview(bgm, columns=columns, show="headings", height=6)
         self.tree.heading("start", text="開始画像")
         self.tree.heading("end", text="終了画像")
         self.tree.heading("music", text="BGM")
-        self.tree.heading("fade", text="曲間フェード")
-        self.tree.column("start", width=160)
-        self.tree.column("end", width=160)
-        self.tree.column("music", width=380)
-        self.tree.column("fade", width=100, anchor="center")
+        self.tree.column("start", width=200)
+        self.tree.column("end", width=200)
+        self.tree.column("music", width=420)
         self.tree.pack(fill="both", expand=True)
         self.tree.bind("<Double-1>", lambda e: self.edit_bgm())
 
@@ -789,11 +1072,15 @@ class App(tk.Tk):
         if not n:
             self.summary.config(text="画像ファイルが見つかりません。")
             return
-        duration = n * float(self.interval_var.get())
+        title_seconds = (
+            float(self.title_dur_var.get()) if self.title_on_var.get() else 0.0
+        )
+        duration = title_seconds + n * float(self.interval_var.get())
         mins = int(duration // 60)
         secs = int(round(duration % 60))
+        head = f"タイトル{title_seconds:g}秒 + " if title_seconds else ""
         self.summary.config(
-            text=f"{n}枚 / 予想動画時間 約 {mins}分{secs:02d}秒 / "
+            text=f"{n}枚 / 予想動画時間 約 {head}{mins}分{secs:02d}秒 / "
                  f"先頭: {self.images[0].name} / 最後: {self.images[-1].name}"
         )
 
@@ -841,8 +1128,30 @@ class App(tk.Tk):
             end = self.images[s.end_index].name if self.images else ""
             self.tree.insert(
                 "", "end", iid=str(i),
-                values=(start, end, s.audio_path.name, f"{s.fade_seconds:g} 秒")
+                values=(start, end, s.audio_path.name)
             )
+
+    def title_card(self) -> TitleCard:
+        return TitleCard(
+            enabled=bool(self.title_on_var.get()),
+            main=self.title_main_var.get(),
+            sub=self.title_sub_var.get(),
+            date=self.title_date_var.get(),
+            duration=float(self.title_dur_var.get()),
+            fade_seconds=float(self.title_fade_var.get()),
+            bg_color=parse_color(self.title_bg_var.get(), "#FFFFFF"),
+            fg_color=parse_color(self.title_fg_var.get(), "#333333"),
+        )
+
+    def bgm_timing(self) -> BGMTiming:
+        return BGMTiming(
+            first_offset=float(self.bgm_offset_var.get()),
+            first_fade_in=float(self.bgm_first_fade_var.get()),
+            fade_out=float(self.bgm_fadeout_var.get()),
+            silence_gap=float(self.bgm_gap_var.get()),
+            fade_in=float(self.bgm_fadein_var.get()),
+            final_fade_out=float(self.bgm_final_var.get()),
+        )
 
     def encoder_pref_internal(self):
         v = self.encoder_var.get()
@@ -861,6 +1170,22 @@ class App(tk.Tk):
             raise ValueError("写真の間隔は0より大きくしてください。")
         if float(self.transition_var.get()) >= float(self.interval_var.get()):
             raise ValueError("写真クロスフェードは写真の間隔より短くしてください。")
+        if self.title_on_var.get():
+            if float(self.title_dur_var.get()) <= 0:
+                raise ValueError("タイトルカードの表示時間は0より大きくしてください。")
+            if float(self.title_fade_var.get()) > float(self.title_dur_var.get()):
+                raise ValueError(
+                    "タイトル→写真フェードは、タイトルの表示時間以下にしてください。"
+                )
+            for label, value in (("背景色", self.title_bg_var.get()),
+                                 ("文字色", self.title_fg_var.get())):
+                try:
+                    ImageColor.getrgb(value.strip())
+                except Exception:
+                    raise ValueError(
+                        "タイトルカードの" + label + "が読めません。"
+                        " #FFFFFF のような形式で指定してください。"
+                    )
 
     def start(self):
         try:
@@ -890,6 +1215,8 @@ class App(tk.Tk):
             encoder_pref=self.encoder_pref_internal(),
             q=self.q,
             stop_event=self.stop_event,
+            title=self.title_card(),
+            bgm_timing=self.bgm_timing(),
         )
 
         def work():
