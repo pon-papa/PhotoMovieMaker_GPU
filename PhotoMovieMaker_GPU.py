@@ -1051,8 +1051,9 @@ class PhotoOrderDialog(tk.Toplevel):
     一覧はパスと名前しか持たないので、写真が何百枚あっても軽いまま。
     """
 
-    MARK_ON = "レ"
-    MARK_OFF = "-"
+    # 環境によって見え方が変わらないよう、記号はASCIIだけで表す。
+    MARK_ON = "[X]"
+    MARK_OFF = "[  ]"
 
     def __init__(self, master, entries: list[tuple[Path, bool]]):
         super().__init__(master)
@@ -1077,18 +1078,22 @@ class PhotoOrderDialog(tk.Toplevel):
         body = ttk.Frame(frm)
         body.pack(fill="both", expand=True)
 
+        # 画面の高さに合わせて行数を決める。小さい画面でもはみ出さない。
+        self.update_idletasks()
+        rows = max(8, min(20, (self.winfo_screenheight() - 360) // 20))
         self.tree = ttk.Treeview(
             body, columns=("use", "no", "name"), show="headings",
-            height=20, selectmode="extended"
+            height=rows, selectmode="extended"
         )
         self.tree.heading("use", text="上映")
         self.tree.heading("no", text="番号")
         self.tree.heading("name", text="ファイル名")
-        self.tree.column("use", width=50, anchor="center", stretch=False)
+        self.tree.column("use", width=64, anchor="center", stretch=False)
         self.tree.column("no", width=60, anchor="e", stretch=False)
         self.tree.column("name", width=500)
         # 使わない写真は灰色にして見分けやすくする
-        self.tree.tag_configure("off", foreground="#999999")
+        # 使わない行は薄くする。薄くしすぎると読めないので中間の灰色にする。
+        self.tree.tag_configure("off", foreground="#777777")
         self.tree.pack(side="left", fill="both", expand=True)
 
         bar = ttk.Scrollbar(body, orient="vertical", command=self.tree.yview)
@@ -1127,6 +1132,12 @@ class PhotoOrderDialog(tk.Toplevel):
         self.transient(master)
         self.grab_set()
         self.protocol("WM_DELETE_WINDOW", self.destroy)
+        self.update_idletasks()
+        # 念のため、画面より大きくならないように抑える
+        want_w = min(self.winfo_reqwidth(), self.winfo_screenwidth() - 60)
+        want_h = min(self.winfo_reqheight(), self.winfo_screenheight() - 80)
+        self.geometry(f"{want_w}x{want_h}")
+        self.minsize(560, 360)
         self.wait_visibility()
         self.focus_force()
 
@@ -1350,8 +1361,14 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(APP_NAME)
-        self.geometry("1020x980")
-        self.minsize(960, 820)
+        # 大きい画面では今までどおりの見やすさ、
+        # 小さい画面や表示倍率が高い環境では画面に収まる大きさで開く。
+        # 足りないぶんは縦スクロールで届く。
+        self.update_idletasks()
+        width = min(1020, max(720, self.winfo_screenwidth() - 80))
+        height = min(980, max(520, self.winfo_screenheight() - 120))
+        self.geometry(f"{width}x{height}")
+        self.minsize(720, 460)
 
         self.q = Queue()
         self.stop_event = threading.Event()
@@ -1399,8 +1416,31 @@ class App(tk.Tk):
         self.after(120, self.poll_queue)
 
     def build_ui(self):
-        root = ttk.Frame(self, padding=14)
-        root.pack(fill="both", expand=True)
+        # 画面が小さくても下端の「MP4を作成」まで届くよう、全体を縦スクロールにする。
+        # 中身の組み立て方は今までと同じで、置き場所が root になるだけ。
+        outer = ttk.Frame(self)
+        outer.pack(fill="both", expand=True)
+
+        self.page = tk.Canvas(outer, highlightthickness=0, borderwidth=0)
+        vbar = ttk.Scrollbar(outer, orient="vertical", command=self.page.yview)
+        self.page.configure(yscrollcommand=vbar.set)
+        vbar.pack(side="right", fill="y")
+        self.page.pack(side="left", fill="both", expand=True)
+
+        root = ttk.Frame(self.page, padding=14)
+        page_window = self.page.create_window((0, 0), window=root, anchor="nw")
+
+        def on_inner(event):
+            self.page.configure(scrollregion=self.page.bbox("all"))
+
+        def on_outer(event):
+            # 横は常にウィンドウ幅いっぱい（横スクロールはしない）
+            self.page.itemconfigure(page_window, width=event.width)
+
+        root.bind("<Configure>", on_inner)
+        self.page.bind("<Configure>", on_outer)
+        # このウィンドウの中だけでホイールを拾う（別ダイアログには影響しない）
+        self.bind("<MouseWheel>", self.on_mousewheel)
 
         ttk.Label(root, text="PhotoMovieMaker GPU", font=("", 20, "bold")).pack(anchor="w")
         ttk.Label(
@@ -1591,6 +1631,21 @@ class App(tk.Tk):
 
         self.status = ttk.Label(bottom, text="待機中")
         self.status.pack(anchor="w")
+
+    def on_mousewheel(self, event):
+        """メイン画面の縦スクロール。
+
+        一覧（Treeview）の上では、そちらが自前でスクロールするので何もしない。
+        画面全体が勝手に動いて操作しづらくならないようにするため。
+        """
+        widget = event.widget
+        while widget is not None:
+            if isinstance(widget, ttk.Treeview):
+                return
+            widget = getattr(widget, "master", None)
+        if self.page.bbox("all") is None:
+            return
+        self.page.yview_scroll(-1 if event.delta > 0 else 1, "units")
 
     def choose_folder(self):
         p = filedialog.askdirectory(title="写真フォルダーを選択")
