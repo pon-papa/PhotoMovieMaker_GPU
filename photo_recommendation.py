@@ -89,8 +89,12 @@ class RecommendationSettings:
     group_tie_gap: float = 0.15      # 1位との差がこれ以内なら同格（★★★）
     group_weak_gap: float = 8.0      # 1位とこれだけ離れたら★
 
-    # 単独写真は比べる相手がいないので、全体の中での位置で控えめに決める
+    # 単独写真は比べる相手がいないので、控えめに決める。
+    # 上位にいるだけでなく、全体の中央からはっきり離れているときだけ★★★にする。
+    # みんな同じくらいきれいな写真ばかりのときに、わずかな差で
+    # 「こちらがおすすめ」と言い切ってしまわないため。
     singleton_top_percentile: float = 55.0
+    singleton_margin: float = 1.5
 
 
 DEFAULT_SETTINGS = RecommendationSettings()
@@ -544,6 +548,7 @@ def assign_stars(items: list[PhotoAnalysis],
 
     values = {id(a): comparison_value(a) for a in items}
     ordered = sorted(values.values())
+    median = ordered[len(ordered) // 2]
 
     def percentile_of(value: float) -> float:
         if len(ordered) <= 1:
@@ -569,7 +574,8 @@ def assign_stars(items: list[PhotoAnalysis],
                 stars, note = 1, "同じ場面の他を優先した方がよさそう"
             else:
                 stars, note = 2, "同じ場面の中で十分使える"
-        elif percentile_of(value) >= cfg.singleton_top_percentile:
+        elif (percentile_of(value) >= cfg.singleton_top_percentile
+                and value - median >= cfg.singleton_margin):
             stars, note = 3, "単独・技術的に問題なし"
         else:
             stars, note = 2, "単独・十分使える"
