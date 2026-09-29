@@ -70,6 +70,21 @@ class RecommendationSettings:
     # 連鎖で巨大なグループができるのを防ぐため、代表写真との距離も見る
     representative_phash: int = 16
     representative_correlation: float = 0.72
+    # embeddingを使うときは、代表写真との見た目の近さも確認する
+    representative_embedding: float = 0.80
+
+    # --- 画像embedding（任意）---
+    # 実データ614枚で類似度分布を測ってから決めた値。
+    #   人物133枚 : 同じ場面 0.834〜0.951 / 別場面 0.843〜0.864
+    #   犬330枚   : 同じ場面 0.885〜0.990 / 同じ犬の別の日 0.885〜0.887
+    #   前撮り151 : 同じ場面 0.947〜0.984
+    # 犬の「同じ犬・別の日」が0.887まで上がってくるので、
+    # embedding単独で同じ場面と見なすのは0.90以上に限る。
+    embedding_alone: float = 0.90
+    # 0.90に届かない場合は、古典的な特徴とも一致していることを条件にする。
+    embedding_with_classic: float = 0.85
+    embedding_classic_phash: int = 20
+    embedding_classic_correlation: float = 0.88
 
     # --- 技術スコアの重み（合計が1になるよう正規化して使う） ---
     weight_sharpness: float = 0.40
@@ -129,8 +144,11 @@ class PhotoAnalysis:
     stars: int = 0
     note: str = ""
 
-    # 比較用。ヒストグラムは配列なので settings JSON には出さない。
+    # 比較用。配列なので settings JSON には出さない。
     hist: np.ndarray | None = field(default=None, repr=False)
+    # 画像embedding（正規化済み）。無ければ従来どおりの判定になる。
+    embedding: np.ndarray | None = field(default=None, repr=False)
+    group_rule: str = ""
 
     @property
     def aspect(self) -> float:
@@ -388,11 +406,40 @@ def time_close(a: PhotoAnalysis, b: PhotoAnalysis, window: float) -> bool:
     return abs(a.taken_at - b.taken_at) <= window
 
 
-def is_similar(a: PhotoAnalysis, b: PhotoAnalysis,
-               cfg: RecommendationSettings) -> bool:
-    """同じ場面で撮った写真らしいか。
+def is_same_scene_by_embedding(a: PhotoAnalysis, b: PhotoAnalysis,
+                               cfg: RecommendationSettings) -> bool:
+    """embeddingを使って「少し変化した同じ場面」を拾う。
+
+    embeddingだけで決めない。同じ被写体が別の日に写っているだけの写真も
+    見た目が近くなるので、非常に近いとき以外は古典的な特徴の一致も求める。
+    """
+    if a.embedding is None or b.embedding is None:
+        return False
+
+    # ここでは縦横比で門前払いしない。
+    # embeddingは正方形へ中央切り出ししてから見ているので、
+    # 同じ場面を縦で撮ったものと横で撮ったものも近い値になる。
+    # 実データでも、同じ場面の縦横違いが cos 0.90〜0.95 で並んでいた。
+    cos = float(np.dot(a.embedding, b.embedding))
+    if cos >= cfg.embedding_alone:
+        return True
+    if cos < cfg.embedding_with_classic:
+        return False
+    # ここから下は、古典的な特徴も揃っているときだけ認める。
+    # pHashは縦横比が大きく違うと当てにならないので、そこだけ従来のゲートを使う。
+    if a.aspect > 0 and b.aspect > 0:
+        if abs(np.log(a.aspect / b.aspect)) > cfg.aspect_log_tolerance:
+            return False
+    return (hamming(a.phash, b.phash) <= cfg.embedding_classic_phash
+            and correlation(a, b) >= cfg.embedding_classic_correlation)
+
+
+def is_similar_classic(a: PhotoAnalysis, b: PhotoAnalysis,
+                       cfg: RecommendationSettings) -> bool:
+    """従来からある判定。ほぼ同じ写真を確実に見つけるためのもの。
 
     見逃しよりも、違う場面をまとめてしまう方を避けたいので保守的にする。
+    embeddingの有無に関係なく、この判定は変わらない。
     """
     # 縦横比が大きく違うものはまとめない（軽いトリミング程度は許容する）
     if a.aspect > 0 and b.aspect > 0:
@@ -425,6 +472,18 @@ def is_similar(a: PhotoAnalysis, b: PhotoAnalysis,
         return True
 
     return False
+
+
+def is_similar(a: PhotoAnalysis, b: PhotoAnalysis,
+               cfg: RecommendationSettings) -> bool:
+    """同じ場面で撮った写真らしいか。
+
+    従来からある「ほぼ同じ写真」の判定に加えて、embeddingがあれば
+    「少し変化した同じ場面」も拾う。
+    """
+    if is_similar_classic(a, b, cfg):
+        return True
+    return is_same_scene_by_embedding(a, b, cfg)
 
 
 # ------------------------------------------------------------------
@@ -476,8 +535,17 @@ def group_photos(items: list[PhotoAnalysis],
             if m == best:
                 kept.append(m)
                 continue
-            if (hamming(items[best].phash, items[m].phash) <= cfg.representative_phash
-                    and correlation(items[best], items[m]) >= cfg.representative_correlation):
+            near_classic = (
+                hamming(items[best].phash, items[m].phash) <= cfg.representative_phash
+                and correlation(items[best], items[m]) >= cfg.representative_correlation
+            )
+            near_embedding = (
+                items[best].embedding is not None
+                and items[m].embedding is not None
+                and float(np.dot(items[best].embedding, items[m].embedding))
+                >= cfg.representative_embedding
+            )
+            if near_classic or near_embedding:
                 kept.append(m)
             else:
                 dropped.append(m)
@@ -500,6 +568,13 @@ def group_photos(items: list[PhotoAnalysis],
         for idx in members:
             items[idx].group_id = gid
             items[idx].group_size = len(members)
+        # このグループが、従来の判定だけで成立するか（embeddingが効いたか）を記録する
+        classic_only = any(
+            is_similar_classic(items[i], items[j], cfg)
+            for i in members for j in members if i < j
+        )
+        for idx in members:
+            items[idx].group_rule = "classic" if classic_only else "embedding"
 
 
 # ------------------------------------------------------------------
@@ -591,7 +666,7 @@ def assign_stars(items: list[PhotoAnalysis],
 # ------------------------------------------------------------------
 
 def analyze_photos(paths, cfg: RecommendationSettings | None = None,
-                   detector=None,
+                   detector=None, embeddings: dict | None = None,
                    progress=None, should_stop=None,
                    cache: dict | None = None) -> list[PhotoAnalysis]:
     """一覧の全写真を解析して、グループIDと星を付けて返す。
@@ -633,6 +708,10 @@ def analyze_photos(paths, cfg: RecommendationSettings | None = None,
     if progress is not None:
         progress(total, total, "")
 
+    if embeddings:
+        for a in items:
+            a.embedding = embeddings.get(str(a.path))
+
     usable = [a for a in items if a.hist is not None]
     group_photos(usable, cfg)
     assign_stars(usable, cfg)
@@ -642,7 +721,7 @@ def analyze_photos(paths, cfg: RecommendationSettings | None = None,
 def csv_header() -> str:
     return ("filename,group_id,stars,technical_score,sharpness_raw,sharpness_score,"
             "exposure_score,contrast_score,resolution_score,subject_score,"
-            "phash,dhash,width,height,note")
+            "phash,dhash,width,height,embedding_enabled,group_rule,note")
 
 
 def to_csv_row(a: PhotoAnalysis) -> str:
@@ -659,5 +738,7 @@ def to_csv_row(a: PhotoAnalysis) -> str:
         s(a.subject_score),
         format(a.phash, "016x"), format(a.dhash, "016x"),
         str(a.width), str(a.height),
+        "1" if a.embedding is not None else "0",
+        a.group_rule,
         a.note.replace(",", ";"),
     ])

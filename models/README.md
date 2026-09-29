@@ -22,6 +22,7 @@
 | --- | --- | --- | --- |
 | `face_detection_yunet_2023mar.onnx` | 人物の顔の位置 | 232,589 bytes | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` |
 | `object_detection_yolox_2022nov.onnx` | 犬の位置 | 35,858,002 bytes | `c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063` |
+| `dinov2_small_embedding.onnx` | 似た場面の判定（おすすめ解析） | 88,437,819 bytes | `a89a990a98e8022021fd294c94078c8395fc7ae3d59dbc30e80f214ff1b842c5` |
 
 ## 入手元
 
@@ -38,12 +39,27 @@ curl -L -o models/object_detection_yolox_2022nov.onnx "https://media.githubuserc
 
 取得後、上の表のサイズとSHA-256が一致することを確認してください。
 
+## dinov2_small_embedding.onnx について
+
+これは `facebook/dinov2-small`（Apache-2.0）から書き出したONNXです。
+公式配布のONNXが無いため、こちらで変換しています。
+
+- 元の重み: https://huggingface.co/facebook/dinov2-small
+- revision : `ed25f3a31f01632728cabb09d1542f84ab7b0056`
+- 出力     : CLSトークン 384次元
+- opset    : 17 / 入力 `pixel_values` (batch, 3, 224, 224)
+- 変換後に元のPyTorchモデルと突き合わせ、
+  cosine similarity 0.99999988 / 要素ごとの差の最大 2.2e-05 で一致を確認済み
+
+このモデルが無くても、おすすめ解析は従来の指標だけで動きます。
+
 ## ライセンス
 
 | モデル | ライセンス | 権利者 |
 | --- | --- | --- |
 | YuNet (face_detection_yunet) | MIT License | Shiqi Yu |
 | YOLOX (object_detection_yolox) | Apache License 2.0 | Megvii Inc. |
+| DINOv2 (dinov2_small_embedding) | Apache License 2.0 | Meta Platforms, Inc. |
 
 詳細は、リポジトリ直下の [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md) を参照してください。
 

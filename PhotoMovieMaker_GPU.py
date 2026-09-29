@@ -55,6 +55,12 @@ try:
 except Exception:
     photo_recommendation = None
 
+# 画像embedding（似た場面を見つける補助）。無ければ従来の解析だけで動く。
+try:
+    import photo_embedding
+except Exception:
+    photo_embedding = None
+
 
 APP_NAME = "PhotoMovieMaker GPU"
 
@@ -1077,6 +1083,10 @@ class PhotoOrderDialog(tk.Toplevel):
         self._rec_stop = threading.Event()
         self._rec_thread = None
         self._star_symbol = True
+        self._emb_cache = {}
+        self._rec_note = ""
+        # モデルがあれば既定でON。無ければ自動的に従来の解析だけになる。
+        self.use_embedding_var = tk.BooleanVar(value=self.embedding_available())
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
@@ -1146,6 +1156,12 @@ class PhotoOrderDialog(tk.Toplevel):
         self.rec_btn = ttk.Button(side, text="おすすめ解析", width=14,
                                   command=self.toggle_recommendation)
         self.rec_btn.pack()
+        self.emb_check = ttk.Checkbutton(
+            side, text="画像embeddingを使用", variable=self.use_embedding_var)
+        self.emb_check.pack(pady=(6, 0))
+        if not self.embedding_available():
+            self.emb_check.config(state="disabled")
+        self._edit_buttons.append(self.emb_check)
 
         self.count_label = ttk.Label(frm, text="")
         self.count_label.pack(anchor="w", pady=(8, 0))
@@ -1233,6 +1249,18 @@ class PhotoOrderDialog(tk.Toplevel):
             self.tree.set(iid, "rec", item.star_text(self._star_symbol))
             self.tree.set(iid, "group", item.group_id or "")
 
+    def embedding_available(self) -> bool:
+        """画像embeddingが使える状態か。モデルが無ければ静かにOFFにする。"""
+        if photo_embedding is None:
+            return False
+        try:
+            path = (Path(__file__).resolve().parent
+                    / photo_embedding.MODELS_DIR_NAME
+                    / photo_embedding.EMBEDDING_MODEL_FILE)
+            return path.is_file() and photo_embedding.ort is not None
+        except Exception:
+            return False
+
     def toggle_recommendation(self):
         if self._rec_thread is not None and self._rec_thread.is_alive():
             self._rec_stop.set()
@@ -1274,11 +1302,32 @@ class PhotoOrderDialog(tk.Toplevel):
         self.set_edit_enabled(False)
         self.rec_btn.config(text="中止", state="normal")
 
+        use_embedding = bool(self.use_embedding_var.get()) and self.embedding_available()
+
         def work():
             try:
+                embeddings = {}
+                if use_embedding:
+                    extractor = photo_embedding.EmbeddingExtractor()
+                    if extractor.available:
+                        embeddings = extractor.embed_paths(
+                            [p for p in paths if str(p) not in self._emb_cache],
+                            progress=lambda d, t: self._rec_queue.put(
+                                ("phase", "embedding生成中", d, t)),
+                            should_stop=self._rec_stop.is_set,
+                        )
+                        self._emb_cache.update(embeddings)
+                    else:
+                        self._rec_queue.put(("note", extractor.unavailable_reason))
+                    embeddings = {str(p): self._emb_cache[str(p)]
+                                  for p in paths if str(p) in self._emb_cache}
+                if self._rec_stop.is_set():
+                    self._rec_queue.put(("done", None))
+                    return
                 items = photo_recommendation.analyze_photos(
                     paths,
                     detector=detector,
+                    embeddings=embeddings,
                     progress=lambda d, t, n: self._rec_queue.put(("progress", d, t, n)),
                     should_stop=self._rec_stop.is_set,
                     cache=self._rec_cache,
@@ -1298,7 +1347,12 @@ class PhotoOrderDialog(tk.Toplevel):
                 if item[0] == "progress":
                     done, total, name = item[1], item[2], item[3]
                     self.count_label.config(
-                        text=f"おすすめ解析中 {done} / {total}    {name}")
+                        text=f"基本特徴量の解析中 {done} / {total}    {name}")
+                elif item[0] == "phase":
+                    label, done, total = item[1], item[2], item[3]
+                    self.count_label.config(text=f"{label} {done} / {total}")
+                elif item[0] == "note":
+                    self._rec_note = item[1]
                 elif item[0] == "done":
                     self.finish_recommendation(item[1])
                     return
@@ -2016,8 +2070,22 @@ class App(tk.Tk):
                 "group": item.group_id,
                 "stars": item.stars,
                 "technical_score": round(item.technical_score, 1),
+                "group_rule": item.group_rule or None,
             }
-        return {"photo_recommendations": data} if data else {}
+        if not data:
+            return {}
+        engine = {
+            "version": 2,
+            "embedding_enabled": any(
+                getattr(i, "embedding", None) is not None
+                for i in self.recommendations.values()
+            ),
+        }
+        if engine["embedding_enabled"] and photo_embedding is not None:
+            engine["embedding_model"] = photo_embedding.MODEL_ID
+            engine["embedding_revision"] = photo_embedding.MODEL_REVISION
+            engine["embedding_dimension"] = photo_embedding.EMBEDDING_DIMENSION
+        return {"photo_recommendations": data, "recommendation_engine": engine}
 
     def title_card(self) -> TitleCard:
         return TitleCard(

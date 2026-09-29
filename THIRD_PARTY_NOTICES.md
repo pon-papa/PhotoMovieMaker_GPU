@@ -36,6 +36,31 @@ PhotoMovieMaker GPU が利用している第三者の成果物と、そのライ
 前処理・後処理の実装は、OpenCV Zoo の公式サンプル
 （`models/object_detection_yolox/yolox.py`, Apache License 2.0）に合わせています。
 
+### DINOv2 — 似た場面の判定（おすすめ解析）
+
+| 項目 | 内容 |
+| --- | --- |
+| ファイル | `models/dinov2_small_embedding.onnx` |
+| 元の重み | facebook/dinov2-small (ViT-S/14) |
+| revision | `ed25f3a31f01632728cabb09d1542f84ab7b0056` |
+| 入手元 | https://huggingface.co/facebook/dinov2-small |
+| コード | https://github.com/facebookresearch/dinov2 |
+| ライセンス | **Apache License 2.0**（コード・重みとも） |
+| 権利者 | Copyright (c) Meta Platforms, Inc. and affiliates |
+| 再配布 | 可。ライセンス本文の同梱が必要（第4条a）。改変した場合はその旨の告知も必要（第4条b） |
+| ライセンス本文 | [licenses/DINOv2-Apache-2.0.txt](licenses/DINOv2-Apache-2.0.txt) |
+
+公式配布のONNXが無いため、本プロジェクトで
+`facebook/dinov2-small` から ONNX へ書き出しています。
+重みそのものは変更していませんが、**CLSトークンだけを返す形へ変換している**ため、
+Apache-2.0 第4条(b)にあたる「変更した旨の告知」としてここに記載します。
+変換の詳細（revision・opset・前処理・検証結果）は
+[models/README.md](models/README.md) にあります。
+
+なお、DINOv2 のうち Cell-DINO / XRay-DINO などの派生モデルは
+FAIR Noncommercial Research License ですが、本プロジェクトが使うのは
+標準の ViT-S/14（Apache-2.0）だけです。
+
 ---
 
 ## 公開・再配布するときの注意
@@ -74,6 +99,7 @@ PhotoMovieMaker GPU が利用している第三者の成果物と、そのライ
 | Pillow | MIT-CMU |
 | NumPy | BSD 3-Clause |
 | opencv-python | Apache License 2.0 |
+| onnxruntime | MIT License |
 | imageio-ffmpeg | BSD 2-Clause |
 
 ## FFmpeg
