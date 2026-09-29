@@ -49,6 +49,12 @@ try:
 except Exception:
     subject_detector = None
 
+# おすすめ解析（写真を選ぶときの手がかり）。無くても写真選択はそのまま使える。
+try:
+    import photo_recommendation
+except Exception:
+    photo_recommendation = None
+
 
 APP_NAME = "PhotoMovieMaker GPU"
 
@@ -1055,13 +1061,22 @@ class PhotoOrderDialog(tk.Toplevel):
     MARK_ON = "[X]"
     MARK_OFF = "[  ]"
 
-    def __init__(self, master, entries: list[tuple[Path, bool]]):
+    def __init__(self, master, entries: list[tuple[Path, bool]],
+                 analysis: dict | None = None, cache: dict | None = None):
         super().__init__(master)
         self.title("写真の順番と使用する写真")
         self.result = None
+        self.analysis_result: dict = dict(analysis or {})
         self.iid_path: dict[str, Path] = {}
         self.iid_used: dict[str, bool] = {}
         self._drag_iid = None
+
+        # おすすめ解析用。解析はここで完結し、動画の作り方には影響しない。
+        self._rec_cache = cache if cache is not None else {}
+        self._rec_queue: Queue = Queue()
+        self._rec_stop = threading.Event()
+        self._rec_thread = None
+        self._star_symbol = True
 
         frm = ttk.Frame(self, padding=12)
         frm.pack(fill="both", expand=True)
@@ -1071,7 +1086,9 @@ class PhotoOrderDialog(tk.Toplevel):
             text="上から順に動画へ出てきます。"
                  "行をドラッグするか、選んで「上へ」「下へ」で入れ替えます。" + chr(10)
                  + "「上映」欄をクリック（またはスペースキー）で、"
-                   "その写真を使うかどうかを切り替えます。",
+                   "その写真を使うかどうかを切り替えます。" + chr(10)
+                 + "「おすすめ解析」を押すと、似た写真をまとめて、"
+                   "技術的に使いやすそうなものへ星を付けます（選ぶのはご自身です）。",
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
@@ -1082,15 +1099,19 @@ class PhotoOrderDialog(tk.Toplevel):
         self.update_idletasks()
         rows = max(8, min(20, (self.winfo_screenheight() - 360) // 20))
         self.tree = ttk.Treeview(
-            body, columns=("use", "no", "name"), show="headings",
+            body, columns=("use", "rec", "group", "no", "name"), show="headings",
             height=rows, selectmode="extended"
         )
         self.tree.heading("use", text="上映")
+        self.tree.heading("rec", text="推奨")
+        self.tree.heading("group", text="類似")
         self.tree.heading("no", text="番号")
         self.tree.heading("name", text="ファイル名")
         self.tree.column("use", width=64, anchor="center", stretch=False)
-        self.tree.column("no", width=60, anchor="e", stretch=False)
-        self.tree.column("name", width=500)
+        self.tree.column("rec", width=76, anchor="center", stretch=False)
+        self.tree.column("group", width=56, anchor="center", stretch=False)
+        self.tree.column("no", width=56, anchor="e", stretch=False)
+        self.tree.column("name", width=380)
         # 使わない写真は灰色にして見分けやすくする
         # 使わない行は薄くする。薄くしすぎると読めないので中間の灰色にする。
         self.tree.tag_configure("off", foreground="#777777")
@@ -1102,16 +1123,29 @@ class PhotoOrderDialog(tk.Toplevel):
 
         side = ttk.Frame(body)
         side.pack(side="left", fill="y", padx=(12, 0))
-        ttk.Button(side, text="上へ", width=14, command=self.move_up).pack(pady=(0, 4))
-        ttk.Button(side, text="下へ", width=14, command=self.move_down).pack(pady=(0, 4))
-        ttk.Button(side, text="自然順に戻す", width=14,
-                   command=self.reset_natural).pack(pady=(0, 14))
+        self._edit_buttons = []
+        up = ttk.Button(side, text="上へ", width=14, command=self.move_up)
+        up.pack(pady=(0, 4))
+        down = ttk.Button(side, text="下へ", width=14, command=self.move_down)
+        down.pack(pady=(0, 4))
+        natural = ttk.Button(side, text="自然順に戻す", width=14,
+                             command=self.reset_natural)
+        natural.pack(pady=(0, 14))
         ttk.Separator(side, orient="horizontal").pack(fill="x", pady=(0, 12))
-        ttk.Button(side, text="すべて選択", width=14,
-                   command=lambda: self.set_all(True)).pack(pady=(0, 4))
-        ttk.Button(side, text="すべて解除", width=14,
-                   command=lambda: self.set_all(False)).pack(pady=(0, 4))
-        ttk.Button(side, text="選択を反転", width=14, command=self.invert_all).pack()
+        all_on = ttk.Button(side, text="すべて選択", width=14,
+                            command=lambda: self.set_all(True))
+        all_on.pack(pady=(0, 4))
+        all_off = ttk.Button(side, text="すべて解除", width=14,
+                             command=lambda: self.set_all(False))
+        all_off.pack(pady=(0, 4))
+        self._edit_buttons += [up, down, natural, all_on, all_off]
+        invert = ttk.Button(side, text="選択を反転", width=14, command=self.invert_all)
+        invert.pack()
+        self._edit_buttons.append(invert)
+        ttk.Separator(side, orient="horizontal").pack(fill="x", pady=(12, 10))
+        self.rec_btn = ttk.Button(side, text="おすすめ解析", width=14,
+                                  command=self.toggle_recommendation)
+        self.rec_btn.pack()
 
         self.count_label = ttk.Label(frm, text="")
         self.count_label.pack(anchor="w", pady=(8, 0))
@@ -1151,7 +1185,7 @@ class PhotoOrderDialog(tk.Toplevel):
             iid = "p" + str(i)
             self.iid_path[iid] = path
             self.iid_used[iid] = bool(used)
-            self.tree.insert("", "end", iid=iid, values=("", "", path.name))
+            self.tree.insert("", "end", iid=iid, values=("", "", "", "", path.name))
         self.renumber()
 
     def current_entries(self) -> list[tuple[Path, bool]]:
@@ -1179,6 +1213,134 @@ class PhotoOrderDialog(tk.Toplevel):
             text=f"一覧 {len(items)}枚 / 動画に使う {shown}枚"
                  + ("" if shown else "   ← このままでは動画を作れません")
         )
+        self.refresh_recommendation()
+
+    # ---------------- おすすめ解析 ----------------
+
+    def refresh_recommendation(self):
+        """推奨・類似の列を、いまの解析結果で描き直す。
+
+        結果は写真のパスで引くので、並べ替えや使用切替の影響を受けない。
+        """
+        if photo_recommendation is None:
+            return
+        for iid in self.tree.get_children():
+            item = self.analysis_result.get(str(self.iid_path[iid]))
+            if item is None:
+                self.tree.set(iid, "rec", "")
+                self.tree.set(iid, "group", "")
+                continue
+            self.tree.set(iid, "rec", item.star_text(self._star_symbol))
+            self.tree.set(iid, "group", item.group_id or "")
+
+    def toggle_recommendation(self):
+        if self._rec_thread is not None and self._rec_thread.is_alive():
+            self._rec_stop.set()
+            self.rec_btn.config(text="中止しています…", state="disabled")
+            return
+        self.start_recommendation()
+
+    def set_edit_enabled(self, enabled: bool):
+        """解析中は並べ替えや使用切替を触れないようにする。"""
+        state = "normal" if enabled else "disabled"
+        for widget in self._edit_buttons:
+            widget.config(state=state)
+
+    def start_recommendation(self):
+        if photo_recommendation is None:
+            messagebox.showwarning(
+                "おすすめ解析",
+                "おすすめ解析のモジュール(photo_recommendation.py)が読み込めません。"
+                + chr(10) + "写真の並べ替えと使用の切り替えはそのまま使えます。",
+                parent=self,
+            )
+            return
+
+        paths = self.current_order()
+        if not paths:
+            return
+
+        detector = None
+        if subject_detector is not None:
+            try:
+                candidate = subject_detector.SubjectDetector()
+                if candidate.available:
+                    detector = candidate
+            except Exception:
+                detector = None
+
+        self._rec_stop.clear()
+        self._rec_queue = Queue()
+        self.set_edit_enabled(False)
+        self.rec_btn.config(text="中止", state="normal")
+
+        def work():
+            try:
+                items = photo_recommendation.analyze_photos(
+                    paths,
+                    detector=detector,
+                    progress=lambda d, t, n: self._rec_queue.put(("progress", d, t, n)),
+                    should_stop=self._rec_stop.is_set,
+                    cache=self._rec_cache,
+                )
+                self._rec_queue.put(("done", items))
+            except Exception as e:
+                self._rec_queue.put(("error", f"{type(e).__name__}: {e}"))
+
+        self._rec_thread = threading.Thread(target=work, daemon=True)
+        self._rec_thread.start()
+        self.after(80, self.poll_recommendation)
+
+    def poll_recommendation(self):
+        try:
+            while True:
+                item = self._rec_queue.get_nowait()
+                if item[0] == "progress":
+                    done, total, name = item[1], item[2], item[3]
+                    self.count_label.config(
+                        text=f"おすすめ解析中 {done} / {total}    {name}")
+                elif item[0] == "done":
+                    self.finish_recommendation(item[1])
+                    return
+                elif item[0] == "error":
+                    self.finish_recommendation(None, error=item[1])
+                    return
+        except Empty:
+            pass
+        if self._rec_thread is not None and self._rec_thread.is_alive():
+            self.after(80, self.poll_recommendation)
+        else:
+            self.finish_recommendation(None)
+
+    def finish_recommendation(self, items, error: str | None = None):
+        self._rec_thread = None
+        self.set_edit_enabled(True)
+        self.rec_btn.config(text="おすすめ解析", state="normal")
+
+        if items:
+            # 星が「豆腐」になる環境では記号を諦めて * にする
+            self._star_symbol = self._stars_render_ok()
+            for a in items:
+                self.analysis_result[str(a.path)] = a
+        self.renumber()
+
+        if error:
+            messagebox.showwarning(
+                "おすすめ解析",
+                "おすすめ解析を完了できませんでした。" + chr(10) + error
+                + chr(10) + "写真の並べ替えと使用の切り替えはそのまま使えます。",
+                parent=self,
+            )
+
+    def _stars_render_ok(self) -> bool:
+        try:
+            probe = ttk.Label(self, text=photo_recommendation.STAR_FULL)
+            probe.update_idletasks()
+            width = probe.winfo_reqwidth()
+            probe.destroy()
+            return width > 2
+        except Exception:
+            return False
 
     # ---------------- 使う / 使わない ----------------
 
@@ -1410,6 +1572,9 @@ class App(tk.Tk):
         # 動画・BGM番号・被写体解析はすべて shown_images() を基準にする。
         self.images: list[Path] = []
         self.excluded: set[Path] = set()
+        # おすすめ解析の結果（写真のパスがキー）。動画の作り方には影響しない。
+        self.recommendations: dict = {}
+        self.recommendation_cache: dict = {}
         self.bgm_segments: list[BGMSegment] = []
 
         self.build_ui()
@@ -1678,6 +1843,7 @@ class App(tk.Tk):
         # 別フォルダーを選び直したら、前のフォルダーの並び順も
         # 使う/使わないの指定も引き継がない。最初は全部を使う。
         self.excluded.clear()
+        self.recommendations.clear()
         self.bgm_segments.clear()
         self.refresh_bgm_tree()
         self.update_summary()
@@ -1787,8 +1953,12 @@ class App(tk.Tk):
         if not self.images:
             messagebox.showinfo(APP_NAME, "先に写真フォルダーを選択してください。")
             return
-        dlg = PhotoOrderDialog(self, self.photo_entries())
+        dlg = PhotoOrderDialog(self, self.photo_entries(),
+                               analysis=self.recommendations,
+                               cache=self.recommendation_cache)
         self.wait_window(dlg)
+        # 解析結果はキャンセルしても残す（写真の選び直しに使えるため）
+        self.recommendations = dlg.analysis_result
         if dlg.result is None:
             return
         self.images = [p for p, _ in dlg.result]
@@ -1828,6 +1998,26 @@ class App(tk.Tk):
             return
         self.camera_note.config(
             text="写真ごとに被写体を1回だけ解析します（PC内で完結）")
+
+    def recommendation_settings_entry(self) -> dict:
+        """おすすめ解析を実行していれば、その結果を設定ファイルへ残す。
+
+        実行していなければ何も足さないので、これまでの設定ファイルと互換。
+        絶対パスは残さず、ファイル名だけにする。
+        """
+        if not self.recommendations:
+            return {}
+        listed = {str(p) for p in self.images}
+        data = {}
+        for key, item in self.recommendations.items():
+            if key not in listed:
+                continue
+            data[item.filename] = {
+                "group": item.group_id,
+                "stars": item.stars,
+                "technical_score": round(item.technical_score, 1),
+            }
+        return {"photo_recommendations": data} if data else {}
 
     def title_card(self) -> TitleCard:
         return TitleCard(
@@ -1933,6 +2123,7 @@ class App(tk.Tk):
                     {"filename": p.name, "included": p not in self.excluded}
                     for p in self.images
                 ],
+                **self.recommendation_settings_entry(),
                 "gui": {
                     "photo_folder": self.folder_var.get(),
                     "encoder_label": self.encoder_var.get(),
