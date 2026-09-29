@@ -227,5 +227,63 @@ class ExternalApiTest(unittest.TestCase):
         self.assertEqual((code, out["error"]["code"]), (2, "usage_error"))
 
 
+class ConnectorManifestTest(unittest.TestCase):
+    """tooldock.tool.json の宣言が、実際の CLI と結果に合っていること。
+
+    ToolDock のコードは使わない（リポジトリは別のまま）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import pmm_cli
+        cls.manifest = json.loads((ROOT / "tooldock.tool.json").read_text(encoding="utf-8"))
+        parser = pmm_cli.build_parser()
+        sub = next(a for a in parser._actions if a.__class__.__name__ == "_SubParsersAction")
+        cls.subparsers = sub.choices
+
+    def test_connector_v1_basics(self):
+        m = self.manifest
+        self.assertEqual(m["connector_version"], 1)
+        self.assertEqual(m["interface"]["entry"], "pmm_cli.py")
+        self.assertEqual(m["interface"]["arguments"], "flags")
+        self.assertTrue((ROOT / m["interface"]["entry"]).is_file())
+        self.assertEqual(m["version"], core.TOOL_VERSION)
+        self.assertEqual(m["api_version"], core.API_VERSION)
+        self.assertEqual(sorted(m["capabilities"]), sorted(core.get_capabilities()["capabilities"]))
+
+    def test_every_action_maps_to_a_real_subcommand_and_flag(self):
+        for action in self.manifest["actions"]:
+            with self.subTest(action=action["name"]):
+                self.assertIn(action["command"], self.subparsers)
+                parser = self.subparsers[action["command"]]
+                known = {s for a in parser._actions for s in a.option_strings}
+                props = action["input_schema"]["properties"]
+                for name, prop in props.items():
+                    flags = [prop[k] for k in ("x-flag", "x-flag-true", "x-flag-false") if k in prop]
+                    self.assertEqual(len(flags), 1, name)
+                    self.assertIn(flags[0], known, f"{name} -> {flags[0]}")
+                self.assertFalse(action["input_schema"]["additionalProperties"])
+
+    def test_declared_output_keys_are_really_returned(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        folder = Path(tmp.name) / "写真 確認"
+        folder.mkdir()
+        make_images(folder, 3)
+        results = {
+            "get_capabilities": core.get_capabilities(),
+            "scan_media": core.scan_media(str(folder)),
+            "analyze_photos": core.analyze_photos(str(folder), use_embedding=False,
+                                                  detect_subjects=False),
+            "create_project_plan": {"project": core.create_project_plan(str(folder)),
+                                    "saved_to": None},
+        }
+        for action in self.manifest["actions"]:
+            if action["name"] not in results:
+                continue
+            for key in action["output_schema"]["required"]:
+                self.assertIn(key, results[action["name"]], f"{action['name']}.{key}")
+
+
 if __name__ == "__main__":
     unittest.main()

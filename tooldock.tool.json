@@ -1,22 +1,19 @@
 {
-  "manifest_version": 1,
-  "id": "photomoviemaker-gpu",
+  "connector_version": 1,
+  "tool_id": "photomoviemaker-gpu",
   "name": "PhotoMovieMaker GPU",
   "version": "0.1.1+external-api",
   "api_version": 1,
-  "description": "写真フォルダーからMP4スライドショーを作るローカルツール。写真の解析・代替候補グループ・上映計画（Project JSON）をCLIから利用できます。",
-  "entry": {
-    "type": "python_cli",
-    "script": "pmm_cli.py",
-    "interpreter": "py"
+  "description": "写真フォルダーからMP4スライドショーを作るローカルツール。写真の解析・代替候補グループ・上映計画（Project JSON）をCLIから利用できます。元の写真は読むだけです。",
+  "namespace": "slideshow",
+  "interface": {
+    "type": "json_cli",
+    "runtime": "py",
+    "entry": "pmm_cli.py",
+    "arguments": "flags",
+    "output": "envelope",
+    "progress": "stderr_jsonl"
   },
-  "interfaces": [
-    {
-      "kind": "cli_json",
-      "label": "JSON CLI (pmm_cli.py)",
-      "reason": "標準出力にJSONだけを返すCLIがあります。"
-    }
-  ],
   "capabilities": [
     "media_scan",
     "photo_analysis",
@@ -26,15 +23,117 @@
     "subject_detection",
     "project_plan"
   ],
-  "commands": [
-    {"name": "capabilities", "summary": "できることの一覧", "reads_media": false, "writes": []},
-    {"name": "scan", "summary": "フォルダー直下の写真を一覧にする", "reads_media": true, "writes": []},
-    {"name": "analyze", "summary": "おすすめ解析（代替候補グループ・同一写真の別バージョン・推奨度・人物/犬の数）", "reads_media": true, "writes": []},
-    {"name": "plan", "summary": "Project JSON（上映計画）の叩き台を作る", "reads_media": true, "writes": ["project_file"]},
-    {"name": "validate", "summary": "Project JSON を確かめる", "reads_media": false, "writes": []}
+  "actions": [
+    {
+      "name": "get_capabilities",
+      "title": "できること",
+      "description": "PhotoMovieMaker GPU（写真からMP4スライドショーを作るローカルツール）で使える操作・対応形式・モデルの有無を返します。",
+      "command": "capabilities",
+      "access": "read",
+      "input_schema": {"type": "object", "properties": {}, "additionalProperties": false},
+      "output_schema": {"type": "object", "required": ["tool", "version", "api_version", "capabilities"]},
+      "timeout_seconds": 60
+    },
+    {
+      "name": "scan_media",
+      "title": "写真の一覧",
+      "description": "指定フォルダー直下の写真を一覧にします（ファイル名・大きさ・縦横）。サブフォルダーは見ません。写真は読むだけです。",
+      "command": "scan",
+      "access": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder",
+                     "description": "写真のフォルダー（絶対パス）"}
+        },
+        "required": ["folder"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["folder", "count", "media"],
+                        "properties": {"count": {"type": "integer"}, "media": {"type": "array"}}},
+      "timeout_seconds": 300
+    },
+    {
+      "name": "analyze_photos",
+      "title": "おすすめ解析",
+      "description": "写真を解析し、代替候補グループ（どれか1枚を選べば残りは外してよい写真の群）・同じ写真の別バージョン（カラー版と白黒版など）・群の中での推奨度（星）・人物/犬の数・撮影時刻を返します。星は写真の価値ではなく群の中での順位です。写真を外したり並べ替えたりはしません。数百枚で数分かかります。",
+      "command": "analyze",
+      "access": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder",
+                     "description": "写真のフォルダー（絶対パス）"},
+          "use_embedding": {"type": "boolean", "default": true, "x-flag-false": "--no-embedding",
+                            "description": "画像embeddingで代替候補グループを作る（falseで従来方式）"},
+          "detect_subjects": {"type": "boolean", "default": true, "x-flag-false": "--no-subjects",
+                              "description": "人物の顔と犬を数える"}
+        },
+        "required": ["folder"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["folder", "count", "engine", "summary", "groups", "photos"],
+                        "properties": {"photos": {"type": "array"}, "groups": {"type": "array"}}},
+      "timeout_seconds": 3600,
+      "progress": true
+    },
+    {
+      "name": "create_project_plan",
+      "title": "上映計画の叩き台",
+      "description": "Project JSON（上映計画）の叩き台を作ります。写真はすべて使う状態・フォルダー順で並びます。どれを外し、どう並べ、何秒見せるかはあなたが決めて、この JSON を書き換えてください。save_to を指定すると *.photomovie.json として保存します。",
+      "command": "plan",
+      "access": "write",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder",
+                     "description": "写真のフォルダー（絶対パス）"},
+          "title": {"type": "string", "maxLength": 200, "x-flag": "--title",
+                    "description": "タイトル（省略するとフォルダー名）"},
+          "analyze": {"type": "boolean", "default": true, "x-flag-true": "--analyze",
+                      "description": "解析結果（グループ・星）を計画に含める"},
+          "use_embedding": {"type": "boolean", "default": true, "x-flag-false": "--no-embedding"},
+          "detect_subjects": {"type": "boolean", "default": true, "x-flag-false": "--no-subjects"},
+          "target_duration_seconds": {"type": "number", "minimum": 1, "maximum": 86400, "x-flag": "--target-duration",
+                                      "description": "目標の長さ（秒）。記録するだけで自動調整はしません"},
+          "save_to": {"type": "string", "maxLength": 1000, "x-path": "output_file", "x-suffixes": [".photomovie.json"],
+                      "x-flag": "--save", "description": "保存先（絶対パス、*.photomovie.json）"},
+          "overwrite": {"type": "boolean", "default": false, "x-flag-true": "--overwrite"}
+        },
+        "required": ["folder"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["project", "saved_to"],
+                        "properties": {"project": {"type": "object"}, "saved_to": {"type": ["string", "null"]}}},
+      "timeout_seconds": 3600,
+      "progress": true
+    },
+    {
+      "name": "validate_project",
+      "title": "上映計画の確認",
+      "description": "保存した Project JSON（*.photomovie.json）が正しい形かを確かめて、中身を返します。",
+      "command": "validate",
+      "access": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project_file": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "project_file",
+                           "x-suffixes": [".photomovie.json"], "x-flag": "--project",
+                           "description": "Project ファイル（絶対パス）"}
+        },
+        "required": ["project_file"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["project", "valid"]},
+      "timeout_seconds": 60
+    }
   ],
-  "mcp": {
-    "adapter": "photomoviemaker"
+  "health_check": {"action": "get_capabilities"},
+  "project_format": {"kind": "photomoviemaker.project", "schema_version": 1, "file_suffix": ".photomovie.json"},
+  "requirements": {
+    "python": ">=3.11",
+    "packages": ["pillow", "numpy", "opencv-python", "imageio-ffmpeg", "onnxruntime"],
+    "local_ai": []
   },
   "data_policy": {
     "source_media": "read_only",

@@ -488,8 +488,13 @@ AI と PhotoMovieMaker の間でやり取りする「何をどう上映するか
 
 ### ToolDock から見つけてもらうための manifest
 
-フォルダー直下の `tooldock.tool.json` に、この CLI で何ができるかを書いてあります。
-ToolDock はこのファイルを読むだけで、PhotoMovieMaker を起動せずに能力を知ることができます。
+フォルダー直下の `tooldock.tool.json` に、この CLI でできること（操作・入力と出力の形・
+読むだけか書くか・どの引数がフォルダーやファイルか）を、ToolDock Connector v1 の形式で書いてあります。
+
+- ToolDock はこのファイルを読むだけで、PhotoMovieMaker を起動せずに能力を知ることができます
+- AI から使うときも、ToolDock の汎用の仕組みがこの宣言どおりに CLI を呼び出します。
+  PhotoMovieMaker 専用のコードは ToolDock 側にありません
+- 宣言と CLI が食い違わないことは、`tests/test_external_api.py` で確かめています
 
 ## BGM区間の指定例
 
