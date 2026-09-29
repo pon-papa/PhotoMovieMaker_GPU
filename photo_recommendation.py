@@ -108,6 +108,22 @@ class RecommendationSettings:
     # 別の撮影カット（pHash 24以上）は通さない値。
     compat_phash: int = 12
     compat_correlation: float = 0.90
+    # embedding だけの結びつきを「相性」として認めるのは、色も明らかには違わないときだけ。
+    # 寄った縦位置のように撮影意図が違う写真が、色相関 0.70〜0.71 のまま
+    # embedding の近さだけで群へ入り込んでいた。
+    # 0.72〜0.76 の間では結果が変わらないので、その中央を取る。
+    compat_embedding_correlation: float = 0.74
+
+    # --- 同じ連写の僅差を、撮影時刻で補う ---
+    # 画角が少し動いただけで pHash が離れ、相性を僅かに外す組がある。
+    # 撮影時刻がごく近く、画像の指標も3つのうち2つが近いときに限って補う。
+    # ただし時刻だけでは絶対にまとめない（撮影時刻の無い写真では何もしない）。
+    burst_seconds: float = 180.0
+    burst_embedding: float = 0.85
+    # 補ってよいのは、合併する2つの群をまたぐ組のうち、この割合以上に
+    # すでに強い結びつきがあるときだけ。大半が同意している中の僅差だけを救い、
+    # 姿勢の違う別カットどうしを時刻の近さだけでつながないため。
+    burst_support: float = 0.75
 
     # --- 技術スコアの重み（合計が1になるよう正規化して使う） ---
     weight_sharpness: float = 0.40
@@ -737,18 +753,44 @@ def edge_kind(a: PhotoAnalysis, b: PhotoAnalysis,
 
 
 def is_compatible(a: PhotoAnalysis, b: PhotoAnalysis,
-                  cfg: RecommendationSettings) -> bool:
+                  cfg: RecommendationSettings, kind: str | None = None) -> bool:
     """「明らかに別物ではない」かどうか。グループの全員に求める緩い条件。
 
     グループへ入るには強い結びつきが1つ必要だが、
     そこにいる全員と同じ強さで結ばれている必要はない。
     全員に強い結びつきを求めると、1秒差の連写のように
     僅差で外れた1組のせいで正しい群まで割れてしまう。
+
+    ただし embedding だけの結びつきは、それだけでは相性とみなさない。
+    見た目の雰囲気が近くても、色も構図も違う写真はいくらでもあるため。
     """
-    if edge_kind(a, b, cfg):
+    if kind is None:
+        kind = edge_kind(a, b, cfg)
+    corr = correlation(a, b)
+    if kind and kind != "embedding:alone":
+        return True               # 古典的な特徴の裏付けがある結びつき
+    if kind == "embedding:alone" and corr >= cfg.compat_embedding_correlation:
         return True
     return (hamming(a.phash, b.phash) <= cfg.compat_phash
-            and correlation(a, b) >= cfg.compat_correlation)
+            and corr >= cfg.compat_correlation)
+
+
+def is_burst_neighbor(a: PhotoAnalysis, b: PhotoAnalysis,
+                      cfg: RecommendationSettings) -> bool:
+    """同じ連写の中で、画角が少し動いただけの組らしいか。
+
+    撮影時刻がごく近く、かつ embedding・pHash・色のうち2つ以上が近いこと。
+    時刻だけでは決めない。撮影時刻が無い写真では常に False。
+    """
+    if a.taken_at is None or b.taken_at is None:
+        return False
+    if abs(a.taken_at - b.taken_at) > cfg.burst_seconds:
+        return False
+    close_embedding = (a.embedding is not None and b.embedding is not None
+                       and float(np.dot(a.embedding, b.embedding)) >= cfg.burst_embedding)
+    close_phash = hamming(a.phash, b.phash) <= cfg.compat_phash
+    close_color = correlation(a, b) >= cfg.compat_correlation
+    return (close_embedding + close_phash + close_color) >= 2
 
 
 def canonical_key(a: PhotoAnalysis) -> tuple:
@@ -808,14 +850,18 @@ def group_candidates(items: list[PhotoAnalysis],
 
     kinds: dict[tuple[int, int], str] = {}
     compat = [[True] * R for _ in range(R)]
+    burst = [[False] * R for _ in range(R)]
     edges = []
     for x in range(R):
         for y in range(x + 1, R):
             a, b = items[reps[x]], items[reps[y]]
             kind = edge_kind(a, b, cfg)
             kinds[(x, y)] = kinds[(y, x)] = kind
-            ok = bool(kind) or is_compatible(a, b, cfg)
+            ok = is_compatible(a, b, cfg, kind)
             compat[x][y] = compat[y][x] = ok
+            if not ok:
+                near = is_burst_neighbor(a, b, cfg)
+                burst[x][y] = burst[y][x] = near
             if kind:
                 cos = 0.0
                 if a.embedding is not None and b.embedding is not None:
@@ -823,6 +869,20 @@ def group_candidates(items: list[PhotoAnalysis],
                 edges.append((EDGE_PRIORITY.get(kind, 0), cos, x, y))
     # 確かな結びつきから順に固める
     edges.sort(key=lambda e: (-e[0], -e[1]))
+
+    def can_merge(gx: int, gy: int, x: int, y: int) -> bool:
+        cross = [(p, q) for p in cluster[gx] for q in cluster[gy]]
+        # またぐ組のうち、すでに強い結びつきがある割合
+        support = sum(1 for p, q in cross if kinds[(p, q)]) / len(cross)
+        for p, q in cross:
+            if {p, q} == {x, y}:
+                continue          # 合併のきっかけになった結びつきそのもの
+            if compat[p][q]:
+                continue
+            if burst[p][q] and support >= cfg.burst_support:
+                continue          # 大半が同意している中の、同じ連写の僅差
+            return False
+        return True
 
     cluster = {x: [x] for x in range(R)}
     where = list(range(R))
@@ -833,7 +893,7 @@ def group_candidates(items: list[PhotoAnalysis],
             gx, gy = where[x], where[y]
             if gx == gy:
                 continue
-            if not all(compat[p][q] for p in cluster[gx] for q in cluster[gy]):
+            if not can_merge(gx, gy, x, y):
                 continue
             cluster[gx] = cluster[gx] + cluster[gy]
             for q in cluster[gy]:

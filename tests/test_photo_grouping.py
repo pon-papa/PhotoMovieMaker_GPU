@@ -47,7 +47,7 @@ def make_struct(seed: int, noise: float = 0.0) -> np.ndarray:
 
 def photo(name, phash=0, dhash=0, hue=0.5, sat=0.6, struct_seed=1,
           struct_noise=0.0, embedding=None, saturation=40.0, score=90.0,
-          size=(4000, 3000)):
+          size=(4000, 3000), taken_at=None):
     a = pr.PhotoAnalysis(path=Path(name), filename=name,
                          width=size[0], height=size[1])
     a.phash = phash
@@ -57,10 +57,22 @@ def photo(name, phash=0, dhash=0, hue=0.5, sat=0.6, struct_seed=1,
     a.saturation = saturation
     a.technical_score = score
     a.sharpness_raw = 500.0
+    a.taken_at = taken_at
     if embedding is not None:
         v = np.asarray(embedding, dtype=np.float32)
         a.embedding = v / np.linalg.norm(v)
     return a
+
+
+def angle(deg: float) -> np.ndarray:
+    """角度で embedding を作る。2枚の cos がそのまま角度の差で決まる。"""
+    r = np.deg2rad(deg)
+    return np.asarray([np.cos(r), np.sin(r), 0.0], dtype=np.float32)
+
+
+def bits(n: int) -> int:
+    """下位 n ビットが立った値。0 との pHash 距離が n になる。"""
+    return (1 << n) - 1
 
 
 def unit(*parts) -> np.ndarray:
@@ -219,6 +231,114 @@ class EdgePriorityTest(unittest.TestCase):
                       embedding=unit(*rng.standard_normal(4)))
             self.assertEqual(bool(pr.edge_kind(a, b, cfg)),
                              pr.is_similar(a, b, cfg))
+
+
+class BoundaryCalibrationTest(unittest.TestCase):
+    """境界条件: 同じ連写の僅差は補い、撮影意図の違う写真は入れない。"""
+
+    T0 = 1_800_000_000.0
+
+    def arc(self, times):
+        """同じ連写を少しずつ画角を変えて撮った5枚。
+        隣どうしは強く結ばれ、両端の1組だけが相性を僅かに外す。"""
+        out = []
+        for k, deg in enumerate((0.0, 7.1, 14.2, 21.3, 28.4)):
+            out.append(photo(f"p{k}.jpg", phash=bits(22) if k == 4 else 0, dhash=0,
+                             hue=0.5, struct_seed=100 + k,
+                             embedding=angle(deg), taken_at=times[k]))
+        return out
+
+    def test_near_miss_in_same_burst_is_joined(self):
+        """強い結びつき多数 + 1組だけ僅差 + 撮影時刻がごく近い → 同じ群。"""
+        cfg = pr.DEFAULT_SETTINGS
+        items = self.arc([self.T0 + 5 * k for k in range(5)])
+        first, last = items[0], items[-1]
+        self.assertEqual(pr.edge_kind(first, last, cfg), "")          # 強い結びつきは無い
+        self.assertFalse(pr.is_compatible(first, last, cfg))          # 相性も僅かに外れる
+        self.assertTrue(pr.is_burst_neighbor(first, last, cfg))       # 同じ連写の僅差
+        pr.group_photos(items, cfg)
+        self.assertEqual(len(groups_of(items)), 1)
+        self.assertEqual(first.group_id, last.group_id)
+
+    def test_same_images_far_apart_in_time_are_not_relaxed(self):
+        """画像は同じ並びでも、撮影時刻が遠ければ僅差を補わない。"""
+        cfg = pr.DEFAULT_SETTINGS
+        far = self.T0 + 33 * 86400
+        items = self.arc([self.T0, self.T0 + 5, self.T0 + 10, self.T0 + 15, far])
+        self.assertFalse(pr.is_burst_neighbor(items[0], items[-1], cfg))
+        pr.group_photos(items, cfg)
+        self.assertNotEqual(items[0].group_id, items[-1].group_id)
+
+    def test_no_capture_time_means_no_relaxation(self):
+        """撮影時刻が無い写真では、時刻による補いは一切しない。"""
+        cfg = pr.DEFAULT_SETTINGS
+        items = self.arc([None] * 5)
+        self.assertFalse(pr.is_burst_neighbor(items[0], items[-1], cfg))
+        pr.group_photos(items, cfg)
+        self.assertNotEqual(items[0].group_id, items[-1].group_id)
+
+    def test_close_in_time_but_different_image_is_not_joined(self):
+        """撮影時刻が近いだけで、画像が違えばまとめない。"""
+        cfg = pr.DEFAULT_SETTINGS
+        a = photo("a.jpg", phash=0, hue=0.10, struct_seed=201,
+                  embedding=angle(0), taken_at=self.T0)
+        b = photo("b.jpg", phash=bits(40), hue=0.90, struct_seed=202,
+                  embedding=angle(75), taken_at=self.T0 + 3)
+        self.assertFalse(pr.is_burst_neighbor(a, b, cfg))
+        items = [a, b]
+        pr.group_photos(items, cfg)
+        self.assertIsNone(a.group_id)
+        self.assertIsNone(b.group_id)
+
+    def test_embedding_alone_with_different_color_does_not_join_a_group(self):
+        """embedding だけが近く、色が明らかに違う写真は、既存の群へ入らない。"""
+        cfg = pr.DEFAULT_SETTINGS
+        members = [photo(f"m{k}.jpg", phash=0, dhash=0, hue=0.5, struct_seed=300 + k,
+                         embedding=angle(2.0 * k)) for k in range(3)]
+        outsider = photo("x.jpg", phash=bits(30), dhash=bits(30), hue=0.05,
+                         struct_seed=399, embedding=angle(12.0))
+        for m in members:
+            self.assertEqual(pr.edge_kind(outsider, m, cfg), "embedding:alone")
+            self.assertLess(pr.correlation(outsider, m), cfg.compat_embedding_correlation)
+            self.assertFalse(pr.is_compatible(outsider, m, cfg))
+        items = members + [outsider]
+        pr.group_photos(items, cfg)
+        self.assertEqual(groups_of(items), {frozenset({"m0.jpg", "m1.jpg", "m2.jpg"})})
+        self.assertIsNone(outsider.group_id)
+
+    def test_embedding_alone_pair_still_forms_on_its_own(self):
+        """2枚だけなら、embedding の強い結びつきそのものでまとまる（従来どおり）。"""
+        cfg = pr.DEFAULT_SETTINGS
+        a = photo("a.jpg", phash=0, hue=0.5, struct_seed=401, embedding=angle(0))
+        b = photo("b.jpg", phash=bits(30), dhash=bits(30), hue=0.05,
+                  struct_seed=402, embedding=angle(10))
+        self.assertEqual(pr.edge_kind(a, b, cfg), "embedding:alone")
+        items = [a, b]
+        pr.group_photos(items, cfg)
+        self.assertEqual(a.group_id, b.group_id)
+
+    def test_burst_is_not_used_when_merge_is_weakly_supported(self):
+        """またぐ組の大半に強い結びつきが無ければ、時刻が近くても群どうしをつながない。"""
+        cfg = pr.DEFAULT_SETTINGS
+
+        def make():
+            xs = [photo(f"x{k}.jpg", phash=0, dhash=0, hue=0.5, struct_seed=500 + k,
+                        embedding=angle(2.0 * k), taken_at=self.T0 + k) for k in range(3)]
+            ys = [photo(f"y{k}.jpg", phash=bits(24), dhash=bits(24), hue=0.5,
+                        struct_seed=600 + k, embedding=angle(26.0 + 2.0 * k),
+                        taken_at=self.T0 + 30 + k) for k in range(3)]
+            return xs + ys
+
+        items = make()
+        pr.group_photos(items, cfg)
+        self.assertEqual(len(groups_of(items)), 2, "支持の弱い合併は、時刻では補わない")
+
+        # 支持率の条件を外すと、同じデータがつながってしまう（条件が効いている確認）
+        loose = pr.RecommendationSettings()
+        loose.burst_support = 0.0
+        items = make()
+        pr.group_photos(items, loose)
+        self.assertEqual(len(groups_of(items)), 1)
 
 
 if __name__ == "__main__":
