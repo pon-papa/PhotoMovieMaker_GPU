@@ -1102,9 +1102,11 @@ def analyze_photos(paths, cfg: RecommendationSettings | None = None,
     if progress is not None:
         progress(total, total, "")
 
-    if embeddings:
-        for a in items:
-            a.embedding = embeddings.get(str(a.path))
+    # 毎回付け直す。embedding を使わない解析では必ず外す。
+    # 解析結果は使い回すので、前回 ON で付いた embedding が残っていると、
+    # チェックを外しても新しいまとめ方のままになってしまう。
+    for a in items:
+        a.embedding = embeddings.get(str(a.path)) if embeddings else None
 
     if phase is not None:
         phase("似た写真をまとめています")

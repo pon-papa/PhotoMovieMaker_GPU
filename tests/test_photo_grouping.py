@@ -341,5 +341,38 @@ class BoundaryCalibrationTest(unittest.TestCase):
         self.assertEqual(len(groups_of(items)), 1)
 
 
+class AnalyzeCacheTest(unittest.TestCase):
+    """解析結果を使い回しても、embedding の ON / OFF が正しく切り替わること。"""
+
+    def test_turning_embedding_off_after_on_returns_to_legacy(self):
+        import tempfile
+        from PIL import Image, ImageDraw
+
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = []
+            for k in range(4):
+                im = Image.new("RGB", (320, 240), (40 + 40 * k, 90, 160))
+                ImageDraw.Draw(im).rectangle([20 + 10 * k, 30, 150 + 10 * k, 200],
+                                             fill=(230, 220, 200))
+                path = Path(tmp) / f"s{k}.png"
+                im.save(path)
+                paths.append(path)
+
+            cache = {}
+            fake = {str(p): unit(1.0, 0.02 * k, 0.0) for k, p in enumerate(paths)}
+            on = pr.analyze_photos(paths, embeddings=fake, cache=cache)
+            self.assertTrue(all(a.embedding is not None for a in on))
+
+            # 同じキャッシュのまま OFF にする（画面でチェックを外して再解析するのと同じ）
+            off = pr.analyze_photos(paths, embeddings={}, cache=cache)
+            self.assertTrue(all(a.embedding is None for a in off),
+                            "前回の embedding が残ってはいけない")
+            self.assertTrue(all(a.variant_family == "" for a in off))
+
+            fresh = pr.analyze_photos(paths)
+            self.assertEqual([a.group_id for a in off], [a.group_id for a in fresh])
+            self.assertEqual([a.stars for a in off], [a.stars for a in fresh])
+
+
 if __name__ == "__main__":
     unittest.main()
