@@ -86,6 +86,29 @@ class RecommendationSettings:
     embedding_classic_phash: int = 20
     embedding_classic_correlation: float = 0.88
 
+    # --- 第1層 Variant Family（同じ写真の別バージョン）---
+    # カラー版と白黒版、コピー、軽い現像違いをひとまとめにする。
+    # 色は見ない。明るさ・コントラストを正規化した「構造」だけを比べる。
+    # 実データ614枚での実測:
+    #   同じ写真の別現像 … 構造 0.9989〜1.0000 / 輪郭 0.9974〜1.0000
+    #   構図が似た別カット … 構造 0.5836〜0.9778 / 輪郭 0.3271〜0.9530
+    # 間がはっきり空いているので、その真ん中より上へ置く。
+    # 別カットを「同じ写真」と誤るほうが危ないので、高めに取る。
+    variant_structure: float = 0.995
+    variant_edge: float = 0.99
+    # 総当たりを減らすための足切り（ここを通ったものだけ構造を比べる）
+    variant_phash: int = 12
+    variant_dhash: int = 12
+
+    # --- 第2層 Selection Candidate Group ---
+    # グループへ入るには強い結びつき（is_similar）が1つ必要。
+    # ただしグループの全員に同じ強さは求めず、
+    # 「明らかに別物ではない」ことだけを確認する。
+    # 犬の1秒差の連写（pHash 8・色 0.93）を助けつつ、
+    # 別の撮影カット（pHash 24以上）は通さない値。
+    compat_phash: int = 12
+    compat_correlation: float = 0.90
+
     # --- 技術スコアの重み（合計が1になるよう正規化して使う） ---
     weight_sharpness: float = 0.40
     weight_exposure: float = 0.25
@@ -148,7 +171,16 @@ class PhotoAnalysis:
     hist: np.ndarray | None = field(default=None, repr=False)
     # 画像embedding（正規化済み）。無ければ従来どおりの判定になる。
     embedding: np.ndarray | None = field(default=None, repr=False)
+    # 色に依存しない構造（縮小グレースケールと輪郭）。同じ写真かどうかの判定用。
+    struct_sig: np.ndarray | None = field(default=None, repr=False)
+    saturation: float = 0.0              # 代表を選ぶとき、カラー版を優先するため
+
     group_rule: str = ""
+    variant_family: str = ""             # 同じ写真の別バージョンのまとまり
+    variant_role: str = ""               # canonical / variant
+    strong_edge: str = ""                # このグループへ入るきっかけになった関係
+    compat_note: str = ""                # グループ内で最も弱かった相性
+    group_embedding_similarity: float | None = None   # 同じ群でいちばん近い相手との値
 
     @property
     def aspect(self) -> float:
@@ -200,6 +232,64 @@ def compute_histogram(bgr: np.ndarray) -> np.ndarray:
     hist = cv2.calcHist([hsv], [0, 1], None, [30, 32], [0, 180, 0, 256])
     cv2.normalize(hist, hist, 0, 1, cv2.NORM_MINMAX)
     return hist
+
+
+STRUCT_SIDE = 64          # 構造を比べる大きさ。これ以上細かくしても判定は変わらない
+
+
+def compute_structure(gray: np.ndarray) -> np.ndarray:
+    """色に依存しない「構造」を取り出す。
+
+    縮小グレースケールと、その輪郭の強さを、それぞれ平均0・分散1にする。
+    正規化してあるので、明るさやコントラストを変えただけでは値が動かない。
+    白黒版とカラー版が同じ写真かどうかを、色を見ずに判定するために使う。
+    float16 で持つ（1枚あたり16KB）。フル解像度の画像は一切持たない。
+    """
+    small = cv2.resize(gray, (STRUCT_SIDE, STRUCT_SIDE),
+                       interpolation=cv2.INTER_AREA).astype(np.float32)
+    gx = cv2.Sobel(small, cv2.CV_32F, 1, 0, ksize=3)
+    gy = cv2.Sobel(small, cv2.CV_32F, 0, 1, ksize=3)
+    edge = cv2.magnitude(gx, gy)
+
+    def unit(a: np.ndarray) -> np.ndarray:
+        a = a - float(a.mean())
+        scale = float(np.sqrt(float((a * a).mean())))
+        return a / scale if scale > 1e-6 else a
+
+    return np.concatenate([unit(small).ravel(),
+                           unit(edge).ravel()]).astype(np.float16)
+
+
+def structure_match(a: "PhotoAnalysis", b: "PhotoAnalysis") -> tuple[float, float]:
+    """(構造の一致度, 輪郭の一致度)。どちらも1.0で完全一致。"""
+    if a.struct_sig is None or b.struct_sig is None:
+        return 0.0, 0.0
+    half = STRUCT_SIDE * STRUCT_SIDE
+    x = a.struct_sig.astype(np.float32)
+    y = b.struct_sig.astype(np.float32)
+    return (float(np.dot(x[:half], y[:half]) / half),
+            float(np.dot(x[half:], y[half:]) / half))
+
+
+def is_same_photo_variant(a: "PhotoAnalysis", b: "PhotoAnalysis",
+                          cfg: "RecommendationSettings") -> bool:
+    """同じ写真の別バージョン（カラー/白黒・コピー・軽い現像違い）か。
+
+    ポーズや表情が少しでも違う別カットは、ここでは同じにしない。
+    まとめ過ぎるほうが危ないので、はっきり一致するときだけ True にする。
+    """
+    if a.struct_sig is None or b.struct_sig is None:
+        return False
+    # 縦横比が違えば別（同じ写真を切り直したものは Candidate Group 側で拾う）
+    if a.aspect > 0 and b.aspect > 0:
+        if abs(np.log(a.aspect / b.aspect)) > cfg.aspect_log_tolerance:
+            return False
+    # 速度のための足切り。ハッシュが遠ければ構造まで見ない。
+    if (hamming(a.phash, b.phash) > cfg.variant_phash
+            or hamming(a.dhash, b.dhash) > cfg.variant_dhash):
+        return False
+    g, e = structure_match(a, b)
+    return g >= cfg.variant_structure and e >= cfg.variant_edge
 
 
 def hamming(a: int, b: int) -> int:
@@ -371,6 +461,9 @@ def analyze_photo(path: Path, cfg: RecommendationSettings,
     result.phash = compute_phash(gray)
     result.dhash = compute_dhash(gray)
     result.hist = compute_histogram(bgr)
+    result.struct_sig = compute_structure(gray)
+    # 彩度の平均。カラー版と白黒版のどちらを代表にするか決めるためだけに使う。
+    result.saturation = float(cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
 
     result.sharpness_raw, result.sharpness_score = score_sharpness(gray)
     result.exposure_score = score_exposure(gray)
@@ -497,14 +590,16 @@ def _find(parent: list[int], i: int) -> int:
     return i
 
 
-def group_photos(items: list[PhotoAnalysis],
-                 cfg: RecommendationSettings) -> None:
-    """似た写真へ同じグループIDを振る。items を直接書き換える。
+def group_photos_legacy(items: list[PhotoAnalysis],
+                        cfg: RecommendationSettings) -> None:
+    """従来のまとめ方（embedding を使わないときはこちら）。
 
     素直な union-find でまとめたあと、代表写真から離れすぎたものを外す。
-    A≈B, B≈C でも A と C が全然違う、という連鎖で
-    巨大なグループができてしまうのを防ぐため。
+    v0.1.1 までと同じ結果になるよう、ここは変えない。
     """
+    # 同じ写真を使い回している場合に備えて、二層のまとめ方の跡を消しておく
+    for a in items:
+        a.variant_family = a.variant_role = a.strong_edge = a.compat_note = ""
     n = len(items)
     parent = list(range(n))
     for i in range(n):
@@ -578,6 +673,245 @@ def group_photos(items: list[PhotoAnalysis],
 
 
 # ------------------------------------------------------------------
+# 写真選別のためのまとめ方（二層）
+#
+#   第1層 Variant Family      … 同じ写真の別バージョン
+#   第2層 Candidate Group     … どれか1枚を選べばよい、代替候補の群
+#
+# 第1層を先に畳むのは、白黒版の色ヒストグラムが元写真と全く違うため、
+# そのままだと第2層の相性チェックを通れず、正しい候補群を割ってしまうから。
+# 第2層では各 Variant Family の代表1枚だけを使って判定し、
+# 群が決まってから家族全員をそこへ入れる。
+# ------------------------------------------------------------------
+
+# 結びつきの強さの順。確かなものから先に固めることで、
+# embedding 由来の弱い関係が先にグループの形を決めてしまうのを防ぐ。
+EDGE_PRIORITY = {
+    "classic:duplicate": 5,
+    "classic:tight": 4,
+    "classic:recomposed": 3,
+    "classic:loose": 2,
+    "embedding:hybrid": 1,      # 古典的な特徴の裏付けがあるので alone より先
+    "embedding:alone": 0,
+}
+
+
+def edge_kind(a: PhotoAnalysis, b: PhotoAnalysis,
+              cfg: RecommendationSettings) -> str:
+    """2枚を直接結んでいる関係の名前。結ばないときは空文字。
+
+    判定の中身は is_similar と同じ。どの規則で通ったかを残すためだけに分ける。
+    """
+    aspect_ok = True
+    if a.aspect > 0 and b.aspect > 0:
+        aspect_ok = abs(np.log(a.aspect / b.aspect)) <= cfg.aspect_log_tolerance
+
+    pd = hamming(a.phash, b.phash)
+    dd = hamming(a.dhash, b.dhash)
+    corr = correlation(a, b)
+
+    if aspect_ok:
+        if (pd <= cfg.duplicate_phash and dd <= cfg.duplicate_dhash
+                and corr >= cfg.duplicate_correlation):
+            return "classic:duplicate"
+        if (pd <= cfg.tight_phash and dd <= cfg.tight_dhash
+                and corr >= cfg.tight_correlation):
+            return "classic:tight"
+        if (pd <= cfg.loose_phash and dd <= cfg.loose_dhash
+                and corr >= cfg.loose_correlation
+                and time_close(a, b, cfg.loose_time_window_seconds)):
+            return "classic:loose"
+        if (pd <= cfg.recomposed_phash and dd <= cfg.recomposed_dhash
+                and corr >= cfg.recomposed_correlation):
+            return "classic:recomposed"
+
+    if a.embedding is None or b.embedding is None:
+        return ""
+    cos = float(np.dot(a.embedding, b.embedding))
+    if cos >= cfg.embedding_alone:
+        return "embedding:alone"
+    if cos >= cfg.embedding_with_classic and aspect_ok and \
+            pd <= cfg.embedding_classic_phash and corr >= cfg.embedding_classic_correlation:
+        return "embedding:hybrid"
+    return ""
+
+
+def is_compatible(a: PhotoAnalysis, b: PhotoAnalysis,
+                  cfg: RecommendationSettings) -> bool:
+    """「明らかに別物ではない」かどうか。グループの全員に求める緩い条件。
+
+    グループへ入るには強い結びつきが1つ必要だが、
+    そこにいる全員と同じ強さで結ばれている必要はない。
+    全員に強い結びつきを求めると、1秒差の連写のように
+    僅差で外れた1組のせいで正しい群まで割れてしまう。
+    """
+    if edge_kind(a, b, cfg):
+        return True
+    return (hamming(a.phash, b.phash) <= cfg.compat_phash
+            and correlation(a, b) >= cfg.compat_correlation)
+
+
+def canonical_key(a: PhotoAnalysis) -> tuple:
+    """Variant Family の代表を選ぶ手がかり。カラー版を白黒版より優先する。"""
+    is_color = 1 if a.saturation >= 8.0 else 0
+    return (is_color, comparison_value(a))
+
+
+def build_variant_families(items: list[PhotoAnalysis],
+                           cfg: RecommendationSettings) -> tuple[list[list[int]], list[int]]:
+    """第1層。同じ写真の別バージョンをまとめ、代表を1枚決める。
+
+    返り値は (家族ごとの添字リスト, 家族ごとの代表の添字)。
+    元ファイルには一切手を触れない。白黒版も消さないし、使用OFFにもしない。
+    """
+    n = len(items)
+    parent = list(range(n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            if _find(parent, i) == _find(parent, j):
+                continue
+            if is_same_photo_variant(items[i], items[j], cfg):
+                parent[_find(parent, i)] = _find(parent, j)
+
+    buckets: dict[int, list[int]] = {}
+    for i in range(n):
+        buckets.setdefault(_find(parent, i), []).append(i)
+    families = sorted(buckets.values(), key=lambda m: min(m))
+
+    reps: list[int] = []
+    counter = 0
+    for members in families:
+        rep = max(members, key=lambda i: canonical_key(items[i]))
+        reps.append(rep)
+        if len(members) > 1:
+            counter += 1
+            vid = f"V{counter:02d}"
+            for i in members:
+                items[i].variant_family = vid
+                items[i].variant_role = "canonical" if i == rep else "variant"
+        else:
+            items[members[0]].variant_family = ""
+            items[members[0]].variant_role = ""
+    return families, reps
+
+
+def group_candidates(items: list[PhotoAnalysis],
+                     cfg: RecommendationSettings) -> None:
+    """第2層。代替候補の群を作る。items を直接書き換える。
+
+    連結成分（A≈B, B≈C なら A と C も同じ）は使わない。
+    A と C が互いに代替候補でないなら、つなげてはいけないため。
+    代わりに、グループへ入るときに「既に居る全員と矛盾しないか」を確かめる。
+    """
+    families, reps = build_variant_families(items, cfg)
+    R = len(families)
+
+    kinds: dict[tuple[int, int], str] = {}
+    compat = [[True] * R for _ in range(R)]
+    edges = []
+    for x in range(R):
+        for y in range(x + 1, R):
+            a, b = items[reps[x]], items[reps[y]]
+            kind = edge_kind(a, b, cfg)
+            kinds[(x, y)] = kinds[(y, x)] = kind
+            ok = bool(kind) or is_compatible(a, b, cfg)
+            compat[x][y] = compat[y][x] = ok
+            if kind:
+                cos = 0.0
+                if a.embedding is not None and b.embedding is not None:
+                    cos = float(np.dot(a.embedding, b.embedding))
+                edges.append((EDGE_PRIORITY.get(kind, 0), cos, x, y))
+    # 確かな結びつきから順に固める
+    edges.sort(key=lambda e: (-e[0], -e[1]))
+
+    cluster = {x: [x] for x in range(R)}
+    where = list(range(R))
+    changed = True
+    while changed:
+        changed = False
+        for _, _, x, y in edges:
+            gx, gy = where[x], where[y]
+            if gx == gy:
+                continue
+            if not all(compat[p][q] for p in cluster[gx] for q in cluster[gy]):
+                continue
+            cluster[gx] = cluster[gx] + cluster[gy]
+            for q in cluster[gy]:
+                where[q] = gx
+            del cluster[gy]
+            changed = True
+            break
+
+    # 家族を展開して、一覧での並び順が早いグループから G01, G02 ... と振る
+    expanded = []
+    for members in cluster.values():
+        photos = [i for x in members for i in families[x]]
+        expanded.append((sorted(members), sorted(photos)))
+    expanded.sort(key=lambda t: min(t[1]))
+
+    counter = 0
+    for fams, photos in expanded:
+        if len(photos) < 2:
+            a = items[photos[0]]
+            a.group_id, a.group_size = None, 1
+            a.group_rule = a.strong_edge = a.compat_note = ""
+            continue
+        counter += 1
+        gid = f"G{counter:02d}"
+        # このグループを成り立たせている関係のうち、いちばん確かなもの
+        present = [kinds[(x, y)] for i, x in enumerate(fams) for y in fams[i + 1:]
+                   if kinds[(x, y)]]
+        best = max(present, key=lambda k: EDGE_PRIORITY.get(k, 0)) if present else "variant"
+        # グループ内でいちばん弱かった相性（どこまで離れた相手を許したか）
+        worst_ph, worst_corr = 0, 1.0
+        for i, x in enumerate(fams):
+            for y in fams[i + 1:]:
+                a, b = items[reps[x]], items[reps[y]]
+                worst_ph = max(worst_ph, hamming(a.phash, b.phash))
+                worst_corr = min(worst_corr, correlation(a, b))
+        note = f"pH<={worst_ph} 色>={worst_corr:.2f}"
+        for i in photos:
+            items[i].group_id = gid
+            items[i].group_size = len(photos)
+            items[i].group_rule = best
+            items[i].compat_note = note
+        for x in fams:
+            own = [kinds[(x, y)] for y in fams if y != x and kinds[(min(x, y), max(x, y))]]
+            strongest = (max(own, key=lambda k: EDGE_PRIORITY.get(k, 0))
+                         if own else "variant-only")
+            for i in families[x]:
+                items[i].strong_edge = strongest
+
+
+def group_photos(items: list[PhotoAnalysis],
+                 cfg: RecommendationSettings) -> None:
+    """似た写真へ同じグループIDを振る。items を直接書き換える。
+
+    embedding があるときは、写真選別のための二層のまとめ方を使う。
+    embedding が無いときは、v0.1.1 までと同じ従来のまとめ方にする。
+    """
+    if any(a.embedding is not None for a in items):
+        group_candidates(items, cfg)
+    else:
+        group_photos_legacy(items, cfg)
+
+    # あとで CSV へ出すための、同じグループでいちばん近い相手との類似度
+    by_group: dict[str, list[PhotoAnalysis]] = {}
+    for a in items:
+        if a.group_id:
+            by_group.setdefault(a.group_id, []).append(a)
+    for members in by_group.values():
+        for a in members:
+            best = None
+            for b in members:
+                if b is a or a.embedding is None or b.embedding is None:
+                    continue
+                cos = float(np.dot(a.embedding, b.embedding))
+                best = cos if best is None else max(best, cos)
+            a.group_embedding_similarity = best
+
+
+# ------------------------------------------------------------------
 # 星
 # ------------------------------------------------------------------
 
@@ -586,7 +920,7 @@ def comparison_value(a: PhotoAnalysis) -> float:
 
     technical_score は 0〜100 で頭打ちになるので、きれいな写真ばかりだと
     横並びになってしまう。飽和しない鮮鋭度をわずかに足して、
-    同じ場面の中でどれが一番くっきりしているかを見分けられるようにする。
+    同じグループの中でどれが一番くっきりしているかを見分けられるようにする。
     """
     bonus = 0.0
     if a.sharpness_raw > 0:
@@ -611,9 +945,9 @@ def assign_stars(items: list[PhotoAnalysis],
                  cfg: RecommendationSettings) -> None:
     """星を決める。写真の価値ではなく、選ぶときの手がかりとしての目安。
 
-    ★★★ おすすめ候補（同じ場面の中で技術的に有力）
+    ★★★ おすすめ候補（同じグループの中で技術的に有力）
     ★★   十分使える
-    ★     同じ場面の他を優先した方がよさそう、または技術的な問題がある
+    ★     同じグループの他を優先した方がよさそう、または技術的な問題がある
 
     似た写真のグループがあるときは、その中での相対比較を重視する。
     単独の写真は比べる相手がいないので、控えめに決める。
@@ -644,11 +978,11 @@ def assign_stars(items: list[PhotoAnalysis],
         if a.group_id:
             gap = group_best[a.group_id] - value
             if gap <= cfg.group_tie_gap:
-                stars, note = 3, "同じ場面の中で有力"
+                stars, note = 3, "同じグループの中で有力"
             elif gap >= cfg.group_weak_gap:
-                stars, note = 1, "同じ場面の他を優先した方がよさそう"
+                stars, note = 1, "同じグループの他を優先した方がよさそう"
             else:
-                stars, note = 2, "同じ場面の中で十分使える"
+                stars, note = 2, "同じグループの中で十分使える"
         elif (percentile_of(value) >= cfg.singleton_top_percentile
                 and value - median >= cfg.singleton_margin):
             stars, note = 3, "単独・技術的に問題なし"
@@ -667,7 +1001,7 @@ def assign_stars(items: list[PhotoAnalysis],
 
 def analyze_photos(paths, cfg: RecommendationSettings | None = None,
                    detector=None, embeddings: dict | None = None,
-                   progress=None, should_stop=None,
+                   progress=None, should_stop=None, phase=None,
                    cache: dict | None = None) -> list[PhotoAnalysis]:
     """一覧の全写真を解析して、グループIDと星を付けて返す。
 
@@ -712,6 +1046,8 @@ def analyze_photos(paths, cfg: RecommendationSettings | None = None,
         for a in items:
             a.embedding = embeddings.get(str(a.path))
 
+    if phase is not None:
+        phase("似た写真をまとめています")
     usable = [a for a in items if a.hist is not None]
     group_photos(usable, cfg)
     assign_stars(usable, cfg)
@@ -719,9 +1055,11 @@ def analyze_photos(paths, cfg: RecommendationSettings | None = None,
 
 
 def csv_header() -> str:
-    return ("filename,group_id,stars,technical_score,sharpness_raw,sharpness_score,"
+    return ("filename,variant_family,variant_role,candidate_group,stars,"
+            "technical_score,sharpness_raw,sharpness_score,"
             "exposure_score,contrast_score,resolution_score,subject_score,"
-            "phash,dhash,width,height,embedding_enabled,group_rule,note")
+            "phash,dhash,width,height,embedding_enabled,embedding_similarity,"
+            "group_rule,strong_edge,compatibility_result,note")
 
 
 def to_csv_row(a: PhotoAnalysis) -> str:
@@ -731,6 +1069,8 @@ def to_csv_row(a: PhotoAnalysis) -> str:
         return f"{v:.{nd}f}" if isinstance(v, float) else str(v)
     return ",".join([
         a.filename.replace(",", " "),
+        a.variant_family,
+        a.variant_role,
         a.group_id or "",
         str(a.stars),
         s(a.technical_score), s(a.sharpness_raw), s(a.sharpness_score),
@@ -739,6 +1079,9 @@ def to_csv_row(a: PhotoAnalysis) -> str:
         format(a.phash, "016x"), format(a.dhash, "016x"),
         str(a.width), str(a.height),
         "1" if a.embedding is not None else "0",
+        s(getattr(a, "group_embedding_similarity", None), 4),
         a.group_rule,
+        a.strong_edge,
+        a.compat_note.replace(",", ";"),
         a.note.replace(",", ";"),
     ])

@@ -1097,8 +1097,10 @@ class PhotoOrderDialog(tk.Toplevel):
                  "行をドラッグするか、選んで「上へ」「下へ」で入れ替えます。" + chr(10)
                  + "「上映」欄をクリック（またはスペースキー）で、"
                    "その写真を使うかどうかを切り替えます。" + chr(10)
-                 + "「おすすめ解析」を押すと、似た写真をまとめて、"
-                   "技術的に使いやすそうなものへ星を付けます（選ぶのはご自身です）。",
+                 + "「おすすめ解析」を押すと、どれか1枚を選べばよい写真をまとめて、"
+                   "技術的に使いやすそうなものへ星を付けます（選ぶのはご自身です）。" + chr(10)
+                 + "「類似」欄の * は、同じ写真の別バージョン"
+                   "（カラー版と白黒版など）があるという印です。",
             justify="left",
         ).pack(anchor="w", pady=(0, 8))
 
@@ -1247,7 +1249,10 @@ class PhotoOrderDialog(tk.Toplevel):
                 self.tree.set(iid, "group", "")
                 continue
             self.tree.set(iid, "rec", item.star_text(self._star_symbol))
-            self.tree.set(iid, "group", item.group_id or "")
+            # 同じ写真の別バージョン（カラー版と白黒版など）には小さく印を付ける。
+            # 列は増やさない。
+            mark = "*" if getattr(item, "variant_family", "") else ""
+            self.tree.set(iid, "group", (item.group_id or "") + mark)
 
     def embedding_available(self) -> bool:
         """画像embeddingが使える状態か。モデルが無ければ静かにOFFにする。"""
@@ -1329,6 +1334,7 @@ class PhotoOrderDialog(tk.Toplevel):
                     detector=detector,
                     embeddings=embeddings,
                     progress=lambda d, t, n: self._rec_queue.put(("progress", d, t, n)),
+                    phase=lambda label: self._rec_queue.put(("phase", label, 0, 0)),
                     should_stop=self._rec_stop.is_set,
                     cache=self._rec_cache,
                 )
@@ -1350,7 +1356,10 @@ class PhotoOrderDialog(tk.Toplevel):
                         text=f"基本特徴量の解析中 {done} / {total}    {name}")
                 elif item[0] == "phase":
                     label, done, total = item[1], item[2], item[3]
-                    self.count_label.config(text=f"{label} {done} / {total}")
+                    if total:
+                        self.count_label.config(text=f"{label} {done} / {total}")
+                    else:
+                        self.count_label.config(text=label)
                 elif item[0] == "note":
                     self._rec_note = item[1]
                 elif item[0] == "done":
@@ -2068,6 +2077,7 @@ class App(tk.Tk):
                 continue
             data[item.filename] = {
                 "group": item.group_id,
+                "variant_family": getattr(item, "variant_family", "") or None,
                 "stars": item.stars,
                 "technical_score": round(item.technical_score, 1),
                 "group_rule": item.group_rule or None,
@@ -2081,6 +2091,8 @@ class App(tk.Tk):
                 for i in self.recommendations.values()
             ),
         }
+        engine["grouping"] = ("selection_candidate_groups"
+                              if engine["embedding_enabled"] else "legacy")
         if engine["embedding_enabled"] and photo_embedding is not None:
             engine["embedding_model"] = photo_embedding.MODEL_ID
             engine["embedding_revision"] = photo_embedding.MODEL_REVISION
