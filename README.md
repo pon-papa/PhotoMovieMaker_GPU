@@ -412,6 +412,85 @@ BGM区間（開始/終了の写真番号とファイル名、曲のパス）が�
 被写体追従ONで作った場合は、写真ごとの解析結果
 （顔の数・犬の数・どちらへ寄ったか・目標座標）も記録されます。
 
+## AI・自動化から使う（開発中）
+
+画面を使わずに、写真の一覧・おすすめ解析・上映計画づくりを呼び出せます。
+AI から使うときは、別リポジトリの ToolDock（MCP Sidecar）がこの CLI を呼び出します。
+
+役割分担は次のとおりです。
+
+- **AI（または人）**：何を作るか、どの写真を使うか、どう並べるか、何秒見せるかを決める
+- **PhotoMovieMaker**：決まった内容を、解析・変換・書き出しとして確実に実行する
+
+写真を勝手に外したり並べ替えたりする判断は、PhotoMovieMaker には入れていません。
+
+### JSON CLI
+
+標準出力には JSON だけを出し、進捗は標準エラー出力へ出します。
+
+```powershell
+py -3 pmm_cli.py capabilities
+py -3 pmm_cli.py scan --folder "C:\写真\広島旅行"
+py -3 pmm_cli.py analyze --folder "C:\写真\広島旅行"
+py -3 pmm_cli.py plan --folder "C:\写真\広島旅行" --title "広島旅行" --analyze --save "C:\計画\広島.photomovie.json"
+py -3 pmm_cli.py validate --project "C:\計画\広島.photomovie.json"
+```
+
+| コマンド | 内容 |
+| --- | --- |
+| `capabilities` | できること・対応形式・モデルの有無 |
+| `scan` | フォルダー直下の写真の一覧（名前・大きさ・縦横） |
+| `analyze` | おすすめ解析（代替候補グループ・同じ写真の別バージョン・推奨度・人物/犬の数・撮影時刻） |
+| `plan` | Project JSON（上映計画）の叩き台 |
+| `validate` | Project JSON が正しい形かの確認 |
+
+終了コードは 0=成功 / 1=処理できなかった / 2=使い方の誤り / 130=中止 です。
+エラーのときも JSON（`"ok": false` と `error.code`）を返します。
+
+- 元の写真は**読むだけ**です。削除・移動・名前の変更・上書きはしません
+- フォルダーの**直下だけ**を見ます。サブフォルダーやドライブ全体は探しません
+- 通信はしません。モデルを実行時にダウンロードすることもありません
+- 画面から作る動画・BGM・タイトルカードは、今はまだ CLI から書き出せません（次の段階）
+
+### Project JSON（上映計画）
+
+AI と PhotoMovieMaker の間でやり取りする「何をどう上映するか」の計画です。
+ファイル名は `*.photomovie.json` にします。
+
+新しい形式を別に作るのではなく、動画を作ったときに保存する
+`*_settings.json` と**同じ区画名・同じ中身**（`video`・`title_card`・`bgm_timing`・`bgm_segments`）を使っています。
+
+```json
+{
+  "kind": "photomoviemaker.project",
+  "schema_version": 1,
+  "project": {"title": "広島旅行", "source_folder": "C:\\写真\\広島旅行", "target_duration_seconds": 240},
+  "media": [
+    {"file": "001.jpg", "type": "image", "enabled": true, "order": 1,
+     "candidate_group": "G01", "variant_family": null, "stars": 3}
+  ],
+  "video": {"width": 1920, "height": 1080, "fps": 30, "interval_seconds": 8.0,
+            "transition_seconds": 1.0, "zoom_percent": 8.0, "blur_background": true,
+            "camera_mode": "legacy", "encoder_choice": "auto"},
+  "title_card": {"enabled": true, "main": "広島旅行", "...": "..."},
+  "bgm_timing": {"first_offset": 3.0, "...": "..."},
+  "bgm_segments": [],
+  "recommendation_engine": {"grouping": "selection_candidate_groups", "...": "..."},
+  "extensions": {}
+}
+```
+
+- `media[].file` はファイル名だけです（フォルダーの外を指す指定は受け付けません）
+- 叩き台では、写真はすべて `enabled: true`・フォルダーの順です。外す・並べ替えるのは計画を書く側です
+- `type` は今は `image` だけを扱います。`video`（写真の間に挟む動画）は将来のために形だけ用意しています
+- トランジションの種類や、曲の拍・小節に合わせた演出などは、将来 `extensions` に入れる予定です
+- `project.source_folder` には写真フォルダーの絶対パスが入ります。共有するときは注意してください
+
+### ToolDock から見つけてもらうための manifest
+
+フォルダー直下の `tooldock.tool.json` に、この CLI で何ができるかを書いてあります。
+ToolDock はこのファイルを読むだけで、PhotoMovieMaker を起動せずに能力を知ることができます。
+
 ## BGM区間の指定例
 
 写真が

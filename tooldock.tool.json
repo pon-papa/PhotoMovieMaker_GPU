@@ -1,0 +1,44 @@
+{
+  "manifest_version": 1,
+  "id": "photomoviemaker-gpu",
+  "name": "PhotoMovieMaker GPU",
+  "version": "0.1.1+external-api",
+  "api_version": 1,
+  "description": "写真フォルダーからMP4スライドショーを作るローカルツール。写真の解析・代替候補グループ・上映計画（Project JSON）をCLIから利用できます。",
+  "entry": {
+    "type": "python_cli",
+    "script": "pmm_cli.py",
+    "interpreter": "py"
+  },
+  "interfaces": [
+    {
+      "kind": "cli_json",
+      "label": "JSON CLI (pmm_cli.py)",
+      "reason": "標準出力にJSONだけを返すCLIがあります。"
+    }
+  ],
+  "capabilities": [
+    "media_scan",
+    "photo_analysis",
+    "photo_recommendation",
+    "variant_family",
+    "candidate_group",
+    "subject_detection",
+    "project_plan"
+  ],
+  "commands": [
+    {"name": "capabilities", "summary": "できることの一覧", "reads_media": false, "writes": []},
+    {"name": "scan", "summary": "フォルダー直下の写真を一覧にする", "reads_media": true, "writes": []},
+    {"name": "analyze", "summary": "おすすめ解析（代替候補グループ・同一写真の別バージョン・推奨度・人物/犬の数）", "reads_media": true, "writes": []},
+    {"name": "plan", "summary": "Project JSON（上映計画）の叩き台を作る", "reads_media": true, "writes": ["project_file"]},
+    {"name": "validate", "summary": "Project JSON を確かめる", "reads_media": false, "writes": []}
+  ],
+  "mcp": {
+    "adapter": "photomoviemaker"
+  },
+  "data_policy": {
+    "source_media": "read_only",
+    "network": "none",
+    "runtime_download": false
+  }
+}

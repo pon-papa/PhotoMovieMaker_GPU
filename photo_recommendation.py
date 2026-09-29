@@ -176,6 +176,10 @@ class PhotoAnalysis:
     contrast_score: float = 0.0
     resolution_score: float = 0.0
     subject_score: float | None = None   # 検出できなかったときは None（減点しない）
+    # 顔・犬を数えたときだけ入る（検出器を使わなかったときは None）。
+    # 外部から「人物の写真か・犬の写真か」を知るための情報で、採点には使わない。
+    face_count: int | None = None
+    dog_count: int | None = None
     technical_score: float = 0.0
 
     group_id: str | None = None
@@ -494,6 +498,9 @@ def analyze_photo(path: Path, cfg: RecommendationSettings,
         except Exception:
             detection = None
     result.subject_score = score_subject(detection, result.width, result.height)
+    if detection is not None:
+        result.face_count = int(detection.face_count)
+        result.dog_count = int(detection.dog_count)
     result.technical_score = combine_technical(result, cfg)
     return result
 
