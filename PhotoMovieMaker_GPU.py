@@ -20,6 +20,7 @@ from __future__ import annotations
 import os
 import re
 import json
+import math
 import random
 import shutil
 import tempfile
@@ -67,6 +68,22 @@ APP_NAME = "PhotoMovieMaker GPU"
 # カメラワーク。既定は従来方式で、何も設定しなければ今までと同じ結果になる。
 CAMERA_LEGACY = "legacy"
 CAMERA_SUBJECT = "subject"
+# 被写体へ寄りつつ、見つかった被写体の枠（顔・人物・犬）＋余白が最後のフレームまで画面に残るよう、
+# 写真ごとにズームを弱め、パンを抑える（SI Director v2）。指定しなければ従来のまま。
+CAMERA_SUBJECT_SAFE = "subject_safe"
+SUBJECT_CAMERA_MODES = (CAMERA_SUBJECT, CAMERA_SUBJECT_SAFE)
+SAFE_MARGIN_RATIO = 0.03        # 被写体の枠の外側に残す余白（表示している写真の幅・高さに対する比率）
+SAFE_ZOOM_STEP_PERCENT = 0.5    # 収まらないときにズームを弱める刻み（8% → 7.5% → … → 0%）
+SAFE_MIN_RELATIVE_AREA = 0.2    # 同じ種類で一番大きい枠の 20% 未満の枠（遠くの人など）は守る対象にしない
+SAFE_OPEN_EDGE_RATIO = 0.015    # 枠が写真の端からこの距離以内なら、その辺は元の写真ですでに切れている（守らない）
+PAN_RATIO = 0.34                # パンはズームで生まれた余白のこの割合まで（render_motion と同じ値）
+
+# 写真と写真のつなぎ方（SI Director v2）。Project に指定が無ければ従来どおりクロスフェードだけ。
+TRANSITION_CROSSFADE = "crossfade"
+TRANSITION_CUT = "cut"
+TRANSITION_FADE_BLACK = "fade_black"
+TRANSITION_SLIDE = "slide"
+TRANSITION_TYPES = (TRANSITION_CROSSFADE, TRANSITION_CUT, TRANSITION_FADE_BLACK, TRANSITION_SLIDE)
 SUPPORTED_IMAGES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 AUDIO_FILETYPES = [
     ("Audio", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
@@ -241,6 +258,8 @@ class BGMTiming:
 class Motion:
     dx: float
     dy: float
+    # この写真だけのズーム（1.0 = ズームなし）。None なら全体のズーム（zoom_percent）のまま。
+    zoom: float | None = None
 
 
 class VideoRenderer:
@@ -286,6 +305,8 @@ class VideoRenderer:
         # 並べ替えても別の写真へ結果が付かないよう、キーは写真のパスにする。
         self.detections: dict[str, object] = {}
         self.source_sizes: dict[str, tuple[int, int]] = {}
+        # 安全な構図（subject_safe）で写真ごとに決めたこと。設定ファイルと書き出し結果に残す。
+        self.framing_log: list[dict] = []
 
         self.interval_frames = max(1, round(self.interval * self.fps))
         self.transition_frames = max(0, round(self.transition * self.fps))
@@ -549,7 +570,7 @@ class VideoRenderer:
         # 被写体追従ONで、その写真に被写体が1つだけ見つかっていれば、
         # パン方向だけを目標方向へ差し替える。
         # 見つからない・複数ある・解析に失敗した写真は上のランダム方向のまま。
-        if self.camera_mode == CAMERA_SUBJECT and self.detections:
+        if self.camera_mode in SUBJECT_CAMERA_MODES and self.detections:
             for i in range(len(result)):
                 try:
                     m = self.subject_motion(i)
@@ -557,7 +578,165 @@ class VideoRenderer:
                     m = None
                 if m is not None:
                     result[i] = m
+
+        # 安全な構図: 上で決めた動き（寄る方向）を基本に、被写体の枠＋余白が
+        # 最後のフレームまで画面に残るよう、ズームを弱め・パンを抑える。
+        if self.camera_mode == CAMERA_SUBJECT_SAFE:
+            self.framing_log = []
+            for i in range(len(result)):
+                try:
+                    result[i], entry = self.safe_motion(i, result[i])
+                except Exception as e:      # 1枚の計算に失敗しても、その写真は元の動きのまま
+                    entry = {"adjustment": "error", "note": f"{type(e).__name__}"}
+                entry.update(photo=i + 1, file=self.images[i].name)
+                self.framing_log.append(entry)
         return result
+
+    # ------------------------------------------------------------------
+    # 安全な構図（subject_safe）
+    # 「被写体の中心へ寄る」だけでなく「大事な被写体の範囲を画面に残す」ことを保証する。
+    # 服・ドレスを見分けるモデルは使わない。既存の検出の枠（顔・人物・犬）と幾何だけで決める。
+    # ------------------------------------------------------------------
+
+    def photo_rect_on_canvas(self, index: int):
+        """写真が実際に見えている範囲（canvas のピクセル座標）と、元写真→canvas の写し方。"""
+        iw, ih = self.source_sizes[str(self.images[index])]
+        im_ratio, dest_ratio = iw / ih, self.w / self.h
+        if self.blur_background:
+            if im_ratio > dest_ratio:
+                fw, fh = self.w, max(1, round(ih / iw * self.w))
+            elif im_ratio < dest_ratio:
+                fw, fh = max(1, round(iw / ih * self.h)), self.h
+            else:
+                fw, fh = self.w, self.h
+            px, py = (self.w - fw) // 2, (self.h - fh) // 2
+
+            def to_canvas(nx, ny):
+                return px + nx * fw, py + ny * fh
+            return (float(px), float(py), float(px + fw), float(py + fh)), to_canvas, (fw, fh)
+        if im_ratio > dest_ratio:
+            crop_w, crop_h = ih * dest_ratio, float(ih)
+        else:
+            crop_w, crop_h = float(iw), iw / dest_ratio
+        ox, oy = (iw - crop_w) / 2.0, (ih - crop_h) / 2.0
+
+        def to_canvas(nx, ny):
+            return (nx * iw - ox) / crop_w * self.w, (ny * ih - oy) / crop_h * self.h
+        return (0.0, 0.0, float(self.w), float(self.h)), to_canvas, (self.w * iw / crop_w, self.h * ih / crop_h)
+
+    def safe_region(self, index: int):
+        """守る範囲（canvas のピクセル座標）。辺ごとに x0, y0, x1, y1、守らない辺は None。
+
+        - 守る枠: 顔・人物・犬の枠（同じ種類で一番大きい枠の 20% 未満は遠くの写り込みとして外す）
+        - 枠が写真の端（見えている範囲の端）に届いている辺は、元の写真ですでに切れているので守らない
+        - 余白は 3%。ただし写真の端までの隙間の半分まで（余白のせいでズームを止めないため）
+        守る枠が無ければ None。"""
+        key = str(self.images[index])
+        det = self.detections.get(key)
+        if det is None or key not in self.source_sizes:
+            return None
+        boxes = [b for b in (getattr(det, "boxes", None) or []) if b.get("kind") in ("face", "person", "dog")]
+        largest: dict[str, float] = {}
+        for b in boxes:
+            area = (b["x1"] - b["x0"]) * (b["y1"] - b["y0"])
+            largest[b["kind"]] = max(largest.get(b["kind"], 0.0), area)
+        kept = [b for b in boxes
+                if (b["x1"] - b["x0"]) * (b["y1"] - b["y0"]) >= SAFE_MIN_RELATIVE_AREA * largest[b["kind"]]]
+        if not kept:
+            return None
+        rect, to_canvas, (fw, fh) = self.photo_rect_on_canvas(index)
+        x0 = y0 = float("inf")
+        x1 = y1 = float("-inf")
+        for b in kept:
+            ax, ay = to_canvas(b["x0"], b["y0"])
+            bx, by = to_canvas(b["x1"], b["y1"])
+            x0, y0, x1, y1 = min(x0, ax), min(y0, ay), max(x1, bx), max(y1, by)
+        tol_x, tol_y = SAFE_OPEN_EDGE_RATIO * fw, SAFE_OPEN_EDGE_RATIO * fh
+        mx, my = SAFE_MARGIN_RATIO * fw, SAFE_MARGIN_RATIO * fh
+        region = [
+            None if x0 <= rect[0] + tol_x else x0 - min(mx, (x0 - rect[0]) / 2.0),
+            None if y0 <= rect[1] + tol_y else y0 - min(my, (y0 - rect[1]) / 2.0),
+            None if x1 >= rect[2] - tol_x else x1 + min(mx, (rect[2] - x1) / 2.0),
+            None if y1 >= rect[3] - tol_y else y1 + min(my, (rect[3] - y1) / 2.0),
+        ]
+        return tuple(region)
+
+    def visible_rect(self, motion: Motion, zoom: float):
+        """動きの最後のフレーム（一番寄ったとき）に見えている canvas の範囲。
+
+        render_motion の式から、見えている範囲は拡大が進むほど単調に狭くなる。
+        最後のフレームで収まっていれば、途中のフレームでも必ず収まっている。"""
+        s1 = 1.0 - 1.0 / zoom
+        cx, cy = self.w / 2.0, self.h / 2.0
+        kx, ky = motion.dx * self.w * PAN_RATIO, motion.dy * self.h * PAN_RATIO
+        return ((cx - kx) * s1, (cy - ky) * s1, self.w - (cx + kx) * s1, self.h - (cy + ky) * s1)
+
+    @staticmethod
+    def region_inside(region, vis) -> bool:
+        return ((region[0] is None or vis[0] <= region[0]) and (region[1] is None or vis[1] <= region[1])
+                and (region[2] is None or vis[2] >= region[2]) and (region[3] is None or vis[3] >= region[3]))
+
+    def framing_summary(self) -> dict:
+        """安全な構図で写真ごとに決めたことのまとめ（設定ファイル・書き出し結果に残す）。"""
+        log = self.framing_log
+        zooms = [e["zoom_percent"] for e in log if "zoom_percent" in e]
+        counts: dict[str, int] = {}
+        for e in log:
+            counts[e["adjustment"]] = counts.get(e["adjustment"], 0) + 1
+        return {
+            "margin_ratio": SAFE_MARGIN_RATIO,
+            "zoom_step_percent": SAFE_ZOOM_STEP_PERCENT,
+            "configured_zoom_percent": round((self.zoom_end - 1.0) * 100.0, 4),
+            "adjusted": sum(1 for e in log if e["adjustment"] in ("pan_limited", "zoom_reduced", "zoom_off")),
+            "by_adjustment": counts,
+            "average_zoom_percent": round(sum(zooms) / len(zooms), 3) if zooms else None,
+            "photos": log,
+        }
+
+    def safe_motion(self, index: int, motion: Motion):
+        """被写体の範囲が最後まで画面に残る、元の動きに一番近い動きを返す。(Motion, 記録)。
+
+        ズームは設定値から 0.5% ずつ弱め、収まる一番強いズームを使う（寄れる範囲では寄る）。
+        パンは元の方向を基本に、収まる範囲へ抑える。守る枠が無い写真は元の動きのまま。"""
+        base_zoom = self.zoom_end if motion.zoom is None else motion.zoom
+        region = self.safe_region(index)
+        entry = {"zoom_percent": round((base_zoom - 1.0) * 100.0, 3), "adjustment": "none"}
+        if region is None:
+            entry["adjustment"] = "no_subject"
+            return motion, entry
+        entry["region"] = [None if v is None else round(v / d, 4)
+                           for v, d in zip(region, (self.w, self.h, self.w, self.h))]
+        entry["open_sides"] = [name for v, name in zip(region, ("left", "top", "right", "bottom")) if v is None]
+        if base_zoom <= 1.0:
+            return motion, entry
+        if self.region_inside(region, self.visible_rect(motion, base_zoom)):
+            return motion, entry            # そのままで収まっている（従来と同じ動き）
+
+        cx, cy = self.w / 2.0, self.h / 2.0
+        step = SAFE_ZOOM_STEP_PERCENT / 100.0
+        n_steps = int(math.floor((base_zoom - 1.0) / step + 1e-9))
+        candidates = [base_zoom] + [1.0 + (n_steps - j) * step for j in range(1, n_steps + 1)]
+        for zoom in candidates:
+            if zoom <= 1.0 + 1e-9:
+                break
+            s1 = 1.0 - 1.0 / zoom
+            lim_x, lim_y = self.w * PAN_RATIO, self.h * PAN_RATIO
+            # (cx - kx) * s1 <= x0  かつ  w - (cx + kx) * s1 >= x1  を満たす kx の範囲（y も同じ）
+            lo_x = -lim_x if region[0] is None else max(-lim_x, cx - region[0] / s1)
+            hi_x = lim_x if region[2] is None else min(lim_x, (self.w - region[2]) / s1 - cx)
+            lo_y = -lim_y if region[1] is None else max(-lim_y, cy - region[1] / s1)
+            hi_y = lim_y if region[3] is None else min(lim_y, (self.h - region[3]) / s1 - cy)
+            if lo_x > hi_x or lo_y > hi_y:
+                continue
+            kx = min(max(motion.dx * lim_x, lo_x), hi_x)
+            ky = min(max(motion.dy * lim_y, lo_y), hi_y)
+            safe = Motion(kx / lim_x, ky / lim_y, zoom=zoom)
+            entry["zoom_percent"] = round((zoom - 1.0) * 100.0, 3)
+            entry["adjustment"] = "pan_limited" if zoom == base_zoom else "zoom_reduced"
+            return safe, entry
+        entry["zoom_percent"] = 0.0
+        entry["adjustment"] = "zoom_off"
+        return Motion(motion.dx, motion.dy, zoom=1.0), entry
 
     def render_motion(self, base: np.ndarray, motion: Motion, local_frame: int) -> np.ndarray:
         # intervalの最後でzoom_endに達する
@@ -567,11 +746,12 @@ class VideoRenderer:
             u = local_frame / (self.interval_frames - 1)
 
         e = smoothstep(u)
-        scale = 1.0 + (self.zoom_end - 1.0) * e
+        zoom_end = self.zoom_end if motion.zoom is None else motion.zoom
+        scale = 1.0 + (zoom_end - 1.0) * e
 
         # ズームによって生じる余裕の範囲だけパン。
-        dx = motion.dx * (scale - 1.0) * self.w * 0.34
-        dy = motion.dy * (scale - 1.0) * self.h * 0.34
+        dx = motion.dx * (scale - 1.0) * self.w * PAN_RATIO
+        dy = motion.dy * (scale - 1.0) * self.h * PAN_RATIO
 
         cx, cy = self.w / 2.0, self.h / 2.0
         M = np.array([
@@ -1018,7 +1198,7 @@ class VideoRenderer:
             ],
         }
 
-        if self.camera_mode == CAMERA_SUBJECT:
+        if self.camera_mode in SUBJECT_CAMERA_MODES:
             counts: dict[str, int] = {}
             for det in self.detections.values():
                 counts[det.mode] = counts.get(det.mode, 0) + 1
@@ -1043,6 +1223,8 @@ class VideoRenderer:
                     for i, det in shown
                 ],
             }
+        if self.camera_mode == CAMERA_SUBJECT_SAFE:
+            data["safe_framing"] = self.framing_summary()
 
         data.update(self.settings_extra)
 
@@ -1059,7 +1241,7 @@ class VideoRenderer:
     def run(self):
         self.output.parent.mkdir(parents=True, exist_ok=True)
 
-        if self.camera_mode == CAMERA_SUBJECT:
+        if self.camera_mode in SUBJECT_CAMERA_MODES:
             self.analyze_subjects()
             if self.stop_event.is_set():
                 raise InterruptedError("処理を中止しました。")

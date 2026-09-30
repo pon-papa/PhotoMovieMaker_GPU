@@ -66,7 +66,7 @@ DEFAULT_VIDEO = {
     "encoder_choice": "auto",
 }
 ENCODER_CHOICES = {"auto", "nvenc", "cpu"}
-CAMERA_MODES = {app.CAMERA_LEGACY, app.CAMERA_SUBJECT}
+CAMERA_MODES = {app.CAMERA_LEGACY, app.CAMERA_SUBJECT, app.CAMERA_SUBJECT_SAFE}
 MEDIA_TYPES = {"image", "video"}        # video は将来用（今はまだ描画できない）
 # 曲の形式は、画面の曲選択（AUDIO_FILETYPES の絞り込み）と同じものだけ
 AUDIO_SUFFIXES = frozenset(pattern[1:].lower() for pattern in app.AUDIO_FILETYPES[0][1].split())
@@ -1021,6 +1021,8 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
         "width": renderer.w, "height": renderer.h, "fps": renderer.fps,
         "camera_mode": renderer.camera_mode,
         "subject_camera": detections or None,
+        "safe_framing": ({k: v for k, v in renderer.framing_summary().items() if k != "photos"}
+                         if renderer.camera_mode == app.CAMERA_SUBJECT_SAFE else None),
         "title_card": bool(renderer.title),
         "bgm_tracks": [s.audio_path.name for s in plan["segments"]],
         "encoder_used": renderer.encoder_used,

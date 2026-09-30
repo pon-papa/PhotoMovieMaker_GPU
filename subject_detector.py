@@ -9,6 +9,10 @@ PhotoMovieMaker GPU の「被写体追従カメラ」で使う。
 - 顔認識（誰であるか）はしない。顔が「どこにあるか」だけを見る。
   個人識別・顔embedding・照合データベースのたぐいは一切作らない。
 - 犬も個体識別や犬種判定はしない。COCOの dog クラスの位置だけを使う。
+- 人物の全身の枠（COCO の person クラス）は、犬と同じ YOLOX の1回の推論の出力から取り出すだけ。
+  追加のモデルは使わない。追従の目標（mode / target）には使わず、
+  「安全な構図（subject_safe）」で切らずに残す範囲としてだけ使う。
+- 検出数（face_count / dog_count）は参考値。写っていても見落とすことがある。
 - 判断が曖昧なとき（被写体が複数あるなど）は主役を勝手に決めず、
   呼び出し側へ「従来方式へ戻れ」と返す。
 
@@ -20,7 +24,7 @@ PhotoMovieMaker GPU の「被写体追従カメラ」で使う。
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -38,6 +42,10 @@ DOG_MODEL_FILE = "object_detection_yolox_2022nov.onnx"
 FACE_SCORE_THRESHOLD = 0.85   # YuNetのスコア下限
 FACE_NMS_THRESHOLD = 0.30
 DOG_SCORE_THRESHOLD = 0.45    # YOLOXのスコア下限
+# 人物の枠: 顔が見つかっている人物だけは低いスコアでも採る（白いドレスなどでスコアが低くなりやすい）。
+# 顔の中心が枠の上側にある枠だけ。顔の無い低スコアの枠は採らない。
+PERSON_ANCHORED_SCORE = 0.10
+PERSON_FACE_TOP_RATIO = 0.45  # 顔の中心が、人物の枠の上からこの割合までにあること
 DOG_NMS_THRESHOLD = 0.50
 
 # 犬のbbox内で狙う点。横は中央、縦は上から35%＝頭・肩・背中寄り。
@@ -48,7 +56,9 @@ DOG_TARGET_Y_RATIO = 0.35
 # 画面に対して極端に小さい検出は無視する（写り込みや誤検出対策）
 MIN_FACE_AREA_RATIO = 0.0008
 MIN_DOG_AREA_RATIO = 0.0030
+MIN_PERSON_AREA_RATIO = 0.0030
 
+COCO_PERSON_CLASS_ID = 0
 COCO_DOG_CLASS_ID = 16
 YOLOX_INPUT_SIZE = (640, 640)
 YOLOX_STRIDES = (8, 16, 32)
@@ -74,6 +84,9 @@ class SubjectDetection:
     face_confidence: float | None = None
     dog_confidence: float | None = None
     note: str = ""
+    # 見つかった枠（元写真に対する正規化値）。{"kind": face|dog|person, "x0", "y0", "x1", "y1", "score"}
+    # 追従の目標には使わない。安全な構図（subject_safe）で「切らずに残す範囲」を決めるためだけに使う。
+    boxes: list = field(default_factory=list)
 
     @property
     def has_target(self) -> bool:
@@ -130,6 +143,12 @@ class _YoloXDogDetector:
 
     def detect_dogs(self, image_rgb: np.ndarray):
         """戻り値: [(x, y, w, h, score), ...] 元画像のピクセル座標。"""
+        return self.detect_dogs_and_people(image_rgb)[0]
+
+    def detect_dogs_and_people(self, image_rgb: np.ndarray):
+        """1回の推論から犬と人物の枠を取り出す。戻り値: (犬の一覧, 人物の一覧)。
+
+        犬の結果は detect_dogs と同じ。人物は主役判定には使わない（安全な構図の範囲だけ）。"""
         padded, ratio = self._letterbox(image_rgb)
         blob = np.transpose(padded, (2, 0, 1))[np.newaxis, :, :, :]
         self.net.setInput(blob)
@@ -138,10 +157,16 @@ class _YoloXDogDetector:
         dets = outs[0][0]
         dets[:, :2] = (dets[:, :2] + self.grids) * self.expanded_strides
         dets[:, 2:4] = np.exp(dets[:, 2:4]) * self.expanded_strides
+        h, w = image_rgb.shape[:2]
+        return (self._boxes_of(dets, ratio, w, h, COCO_DOG_CLASS_ID, MIN_DOG_AREA_RATIO),
+                self._boxes_of(dets, ratio, w, h, COCO_PERSON_CLASS_ID, MIN_PERSON_AREA_RATIO,
+                               PERSON_ANCHORED_SCORE))
 
-        # dogクラスだけを見る。ほかのクラスは主役判定に使わない。
-        dog_scores = dets[:, 4] * dets[:, 5 + COCO_DOG_CLASS_ID]
-        keep = dog_scores > DOG_SCORE_THRESHOLD
+    @staticmethod
+    def _boxes_of(dets, ratio, w, h, class_id, min_area_ratio, threshold=DOG_SCORE_THRESHOLD):
+        # 1つのクラスだけを見る（dog の閾値・NMS・最小面積はこれまでと同じ値）
+        dog_scores = dets[:, 4] * dets[:, 5 + class_id]
+        keep = dog_scores > threshold
         if not np.any(keep):
             return []
 
@@ -154,19 +179,18 @@ class _YoloXDogDetector:
         xywh[:, 3] = boxes[:, 3]
 
         idx = cv2.dnn.NMSBoxes(
-            xywh.tolist(), scores.tolist(), DOG_SCORE_THRESHOLD, DOG_NMS_THRESHOLD
+            xywh.tolist(), scores.tolist(), threshold, DOG_NMS_THRESHOLD
         )
         if len(idx) == 0:
             return []
         idx = np.array(idx).reshape(-1)
 
         results = []
-        h, w = image_rgb.shape[:2]
         for i in idx:
             x, y, bw, bh = xywh[i] / ratio          # letterboxを戻す
             if bw <= 0 or bh <= 0:
                 continue
-            if (bw * bh) / float(w * h) < MIN_DOG_AREA_RATIO:
+            if (bw * bh) / float(w * h) < min_area_ratio:
                 continue
             results.append((float(x), float(y), float(bw), float(bh), float(scores[i])))
         return results
@@ -281,8 +305,9 @@ class SubjectDetector:
         except Exception as e:
             faces = []
             det.note = f"face detector error: {type(e).__name__}"
+        people = []
         try:
-            dogs = self._dog.detect_dogs(image_rgb)
+            dogs, people = self._dog.detect_dogs_and_people(image_rgb)
         except Exception as e:
             dogs = []
             det.note = (det.note + " / " if det.note else "") + \
@@ -294,6 +319,16 @@ class SubjectDetector:
             det.face_confidence = round(max(f[4] for f in faces), 4)
         if dogs:
             det.dog_confidence = round(max(d[4] for d in dogs), 4)
+        people = [p for p in people if p[4] > DOG_SCORE_THRESHOLD or any(
+            p[0] <= f[0] + f[2] / 2 <= p[0] + p[2]
+            and p[1] <= f[1] + f[3] / 2 <= p[1] + PERSON_FACE_TOP_RATIO * p[3] for f in faces)]
+        for kind, found in (("face", faces), ("dog", dogs), ("person", people)):
+            for x, y, bw, bh, score in found:
+                x0, y0 = max(0.0, x / w), max(0.0, y / h)
+                x1, y1 = min(1.0, (x + bw) / w), min(1.0, (y + bh) / h)
+                if x1 > x0 and y1 > y0:
+                    det.boxes.append({"kind": kind, "x0": round(x0, 6), "y0": round(y0, 6),
+                                      "x1": round(x1, 6), "y1": round(y1, 6), "score": round(score, 4)})
 
         # ---- 主役を勝手に決めないためのルール ----
         # 対象が明確に1つのときだけ追従する。曖昧なら従来方式。
