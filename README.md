@@ -463,8 +463,14 @@ py -3 pmm_cli.py render --project "C:\計画\広島.photomovie.json" --folder "C
   - `--folder` には計画の `source_folder` と同じフォルダーを指定します。写真のフォルダーの中には書き出しません
   - 書き出しは一時フォルダーで行い、完成した MP4 と `*_settings.json` だけを置きます。中止・失敗のときは何も残しません
   - 同じ名前のファイルは `--overwrite` を付けない限り上書きしません
-  - BGM 付きの書き出しは、まだ画面からだけです（`bgm_segments` は空にしてください）
+  - BGM 付きも書き出せます。`--music-folder` に計画の `music_folder` と同じ曲のフォルダーを指定し、曲はその直下のものだけを使います（画面と同じ曲の合成）
 - 環境変数 `TOOLDOCK_CANCEL_FILE` が指すファイルが現れると、解析・書き出しを安全に止めます（自動化から使うときだけ。画面には関係しません）
+
+### SI から写真と BGM で作品を組み立てる（SI Director v1）
+
+AI（SI）が写真と BGM の候補を見比べて、選択・順序・選曲・曲の区間・タイトルを決め、
+PhotoMovieMaker がそのとおりに書き出すための部品があります（`music-scan`・`music-analyze`・`compose`・`preview`・`director`）。
+判断は SI 側で、PhotoMovieMaker の中に AI は入っていません。仕組みと約束ごとは [docs/SI_DIRECTOR_V1.md](docs/SI_DIRECTOR_V1.md) にあります。
 
 ### Project JSON（上映計画）
 

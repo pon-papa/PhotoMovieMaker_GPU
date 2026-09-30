@@ -116,3 +116,13 @@ Project JSON は書き出しの約束、Director Plan は **SI の判断の記�
 見本フレームの一覧（4 秒ごと）で、タイトルと選んだ順の写真を確かめた。
 
 **SI が完成品をどこまで確かめられるか**: 見本フレームの画像は見られる。音は聞けない（音声の有無・長さ・音量の測定値だけ）。完成品を通して見たとは言わない。
+
+## 6. 公式 MCP SDK からの通し試験（ToolDock 経由・2026-10-01）
+
+ToolDock（コードは変えていない）に、写真のフォルダーと曲のフォルダーを `--media-root`、作品の置き場を `--output-root` として渡した。
+公式 MCP SDK から `slideshow_scan_media` → `analyze_photos` → `scan_music` → `analyze_music` → （SI の判断）→ `compose_project`（Director Plan つき）→
+`preview_project` → `render`（`music_folder` つき）まで通した。53.0 秒・映像 1590 フレーム・AAC 音声あり、写真と曲は不変。
+
+- 拒否（9 件）: 許可外の曲のフォルダー（一覧・書き出し）・曲のフォルダー無しで BGM 付き書き出し・計画と違う曲のフォルダー・曲のフォルダーへの書き出し・
+  パスで外を指す曲・JSON でない指示・絶対パス入りの Director Plan・既存の Project の上書き
+- BGM 付き書き出しを途中で中止（MCP の `notifications/cancelled`）→ MP4・`.part`・FFmpeg・一時フォルダーのどれも残らない
