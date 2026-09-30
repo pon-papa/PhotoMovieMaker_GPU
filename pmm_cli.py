@@ -13,6 +13,9 @@ ToolDock の MCP Sidecar は、このコマンドを通して PhotoMovieMaker �
 
     py -3 pmm_cli.py music-scan --folder "C:\\曲"
     py -3 pmm_cli.py music-analyze --folder "C:\\曲"
+    py -3 pmm_cli.py compose --folder "C:\\写真\\旅行" --edits-json "{...}" --save 作品.photomovie.json [--music-folder "C:\\曲"]
+    py -3 pmm_cli.py preview --project 作品.photomovie.json --folder "C:\\写真\\旅行" [--music-folder "C:\\曲"]
+    py -3 pmm_cli.py director --project 作品.photomovie.json --plan-json "{...}" [--overwrite]
 
 終了コード: 0=成功 / 1=処理できなかった / 2=使い方の誤り / 130=中止
 元の写真は読むだけで、書き換えません。
@@ -71,7 +74,29 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("--folder", required=True)
     ma = sub.add_parser("music-analyze", help="曲を技術的に測る（長さ・音量の推移・無音など）")
     ma.add_argument("--folder", required=True)
+    c = sub.add_parser("compose", help="SI の決めた選択・順序・タイトル・BGM 区間で Project JSON を組み立てて保存する")
+    c.add_argument("--folder", required=True)
+    c.add_argument("--edits-json", required=True)
+    c.add_argument("--save", required=True)
+    c.add_argument("--music-folder")
+    c.add_argument("--overwrite", action="store_true")
+    pv = sub.add_parser("preview", help="書き出す前の確認と時間割（何も書かない）")
+    pv.add_argument("--project", required=True)
+    pv.add_argument("--folder", required=True)
+    pv.add_argument("--music-folder")
+    d = sub.add_parser("director", help="Director Plan（SI の判断の記録）を Project の隣に保存する")
+    d.add_argument("--project", required=True)
+    d.add_argument("--plan-json", required=True)
+    d.add_argument("--overwrite", action="store_true")
     return p
+
+
+def _json_argument(text: str, name: str):
+    import pmm_core as core
+    try:
+        return json.loads(text)
+    except ValueError:
+        raise core.CoreError("invalid_edits", f"{name} が JSON として読めません。") from None
 
 
 def should_stop() -> bool:
@@ -127,6 +152,14 @@ def run(argv: list[str]) -> int:
             result = core.scan_music(args.folder)
         elif args.command == "music-analyze":
             result = core.analyze_music(args.folder, progress=progress, should_stop=should_stop)
+        elif args.command == "compose":
+            result = core.compose_project(args.folder, _json_argument(args.edits_json, "edits_json"), args.save,
+                                          music_folder=args.music_folder, overwrite=args.overwrite)
+        elif args.command == "preview":
+            result = core.preview_project(args.project, args.folder, args.music_folder)
+        elif args.command == "director":
+            result = core.save_director_plan(args.project, _json_argument(args.plan_json, "plan_json"),
+                                             overwrite=args.overwrite)
         elif args.command == "render":
             result = core.render_project(args.project, args.folder, args.output,
                                          overwrite=args.overwrite, music_folder=args.music_folder,

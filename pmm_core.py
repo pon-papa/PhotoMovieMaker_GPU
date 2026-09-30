@@ -174,6 +174,9 @@ def get_capabilities() -> dict:
             "render_final",
             "music_scan",
             "music_analysis",
+            "project_compose",
+            "timeline_preview",
+            "director_record",
         ],
         "planned": ["render_preview", "transition_primitives",
                     "video_clips", "beat_aligned_plan"],
@@ -821,6 +824,24 @@ def resolve_bgm(project: dict, music_folder) -> tuple[Path | None, list]:
 
 def _render_plan(project: dict, photo_folder, output_file, music_folder=None) -> dict:
     """render の前に、計画と書き出し先を確かめる。ここでは何も書かない。"""
+    plan = _check_inputs(project, photo_folder, music_folder)
+    root, music_root = plan["root"], plan["music_root"]
+    target = Path(os.path.abspath(str(output_file or "")))
+    if not str(output_file or "").strip() or target.suffix.lower() != VIDEO_SUFFIX:
+        raise CoreError("invalid_output", "書き出し先は *.mp4 のファイルにしてください。")
+    if not target.parent.is_dir():
+        raise CoreError("invalid_output", f"書き出し先のフォルダーがありません: {target.parent}")
+    if _is_inside(target, root):
+        raise CoreError("invalid_output", "写真のフォルダーの中には書き出しません（元の写真を守るため）。")
+    if music_root is not None and _is_inside(target, music_root):
+        raise CoreError("invalid_output", "曲のフォルダーの中には書き出しません（元の曲を守るため）。")
+    plan["target"] = target
+    plan["settings"] = target.with_name(target.stem + "_settings.json")
+    return plan
+
+
+def _check_inputs(project: dict, photo_folder, music_folder=None) -> dict:
+    """計画・写真・曲を確かめる（書き出し先は見ない）。ここでは何も書かない。"""
     root = resolve_folder(photo_folder)
     declared = Path(os.path.abspath(project["project"]["source_folder"]))
     if os.path.normcase(str(declared)) != os.path.normcase(str(root)):
@@ -859,19 +880,8 @@ def _render_plan(project: dict, photo_folder, output_file, music_folder=None) ->
             if app.parse_color(str(value), "") != str(value).strip():
                 raise CoreError("invalid_project", f"タイトルカードの{label}が読めません（#FFFFFF の形式）。")
     timing = app.BGMTiming(**project["bgm_timing"])
-
-    target = Path(os.path.abspath(str(output_file or "")))
-    if not str(output_file or "").strip() or target.suffix.lower() != VIDEO_SUFFIX:
-        raise CoreError("invalid_output", "書き出し先は *.mp4 のファイルにしてください。")
-    if not target.parent.is_dir():
-        raise CoreError("invalid_output", f"書き出し先のフォルダーがありません: {target.parent}")
-    if _is_inside(target, root):
-        raise CoreError("invalid_output", "写真のフォルダーの中には書き出しません（元の写真を守るため）。")
-    if music_root is not None and _is_inside(target, music_root):
-        raise CoreError("invalid_output", "曲のフォルダーの中には書き出しません（元の曲を守るため）。")
-    settings = target.with_name(target.stem + "_settings.json")
     return {"root": root, "images": images, "video": video, "title": title,
-            "timing": timing, "target": target, "settings": settings, "segments": segments}
+            "timing": timing, "segments": segments, "music_root": music_root}
 
 
 def _place(source: Path, target: Path) -> None:
@@ -1017,3 +1027,237 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
         "elapsed_seconds": round(time.perf_counter() - started, 1),
         "warnings": warnings,
     }
+
+
+# ------------------------------------------------------------------
+# SI Director v1: 計画の組み立て・書き出し前の確認・判断の記録
+# （どう見せるかは呼び出し側の SI が決める。ここは決まったことを安全に形にするだけ）
+# ------------------------------------------------------------------
+
+DIRECTOR_SUFFIX = ".director.json"
+DIRECTOR_KIND = "photomoviemaker.director_plan"
+DIRECTOR_VERSION = 1
+DIRECTOR_RESERVED = {"kind", "project_file", "saved_at", "computed"}
+MAX_DIRECTOR_BYTES = 64 * 1024
+EDIT_KEYS = {"selected", "title_card", "video", "bgm_timing", "bgm_segments", "target_duration_seconds", "director"}
+VIDEO_KEYS = set(DEFAULT_VIDEO)
+_ABSOLUTE_PATH = re.compile(r"(?i)(?:^|[\s\"'(])(?:[a-z]:[\\/]|\\\\[^\\\s])")
+
+
+def _clock(seconds: float) -> str:
+    whole = int(round(seconds))
+    return f"{whole // 60:02d}:{whole % 60:02d}"
+
+
+def build_timeline(project: dict, plan: dict) -> dict:
+    """書き出したときの時間割（タイトル・写真・曲）を、同じ VideoRenderer の計算で求める。
+
+    何も描画しない。曲の長さは ffprobe で読むだけ（無ければ unknown）。"""
+    video, title = plan["video"], plan["title"]
+    renderer = app.VideoRenderer(
+        image_paths=plan["images"], output_path=Path(tempfile.gettempdir()) / "pmm_preview_unused.mp4",
+        width=int(video["width"]), height=int(video["height"]), fps=int(video["fps"]),
+        interval_seconds=float(video["interval_seconds"]),
+        transition_seconds=float(video["transition_seconds"]),
+        zoom_percent=float(video["zoom_percent"]), blur_background=bool(video["blur_background"]),
+        bgm_segments=plan["segments"], encoder_pref=video["encoder_choice"], q=Queue(),
+        stop_event=threading.Event(), title=title, bgm_timing=plan["timing"], camera_mode=video["camera_mode"])
+    title_seconds, span, total = renderer.title_duration, renderer.photo_span, renderer.total_duration
+    photos = [{"position": i, "file": path.name, "start_seconds": round(title_seconds + (i - 1) * span, 3),
+               "end_seconds": round(title_seconds + i * span, 3)}
+              for i, path in enumerate(plan["images"], 1)]
+    ffprobe = find_ffprobe()
+    lengths: dict = {}
+    music, warnings = [], []
+    planned = renderer.bgm_plan(renderer.validate_bgm_segments()) if plan["segments"] else []
+    for seg in plan["segments"]:
+        name = seg.audio_path.name
+        if name not in lengths:
+            lengths[name] = _probe_track(ffprobe, seg.audio_path).get("probe_duration_seconds")
+        entry = next((e for e in planned if e[0] is seg), None)
+        item = {"audio": name, "start_photo": seg.start_index + 1, "end_photo": seg.end_index + 1,
+                "track_seconds": lengths[name]}
+        if entry is None:
+            item.update(sounds=False, note="区間が短すぎて鳴らさない（0.30 秒未満）")
+            warnings.append(f"{name}: 区間が短すぎて鳴りません。")
+        else:
+            _, start, duration, fade_in, fade_out = entry
+            item.update(sounds=True, starts_at=round(start, 3), duration_seconds=round(duration, 3),
+                        fade_in_seconds=round(fade_in, 3), fade_out_seconds=round(fade_out, 3))
+            if lengths[name] is not None and lengths[name] + 0.05 < duration:
+                item["repeats"] = True
+                warnings.append(f"{name}: 曲（{lengths[name]:.1f} 秒）が区間（{duration:.1f} 秒）より短く、"
+                                "先頭から繰り返されます。")
+            elif lengths[name] is not None:
+                item["repeats"] = False
+                item["uses_first_seconds_of_track"] = round(duration, 3)
+        music.append(item)
+    silent, cursor = [], 0.0
+    for item in sorted((m for m in music if m["sounds"]), key=lambda m: m["starts_at"]):
+        if item["starts_at"] - cursor > 0.05:
+            silent.append({"start_seconds": round(cursor, 3), "end_seconds": item["starts_at"]})
+        cursor = max(cursor, item["starts_at"] + item["duration_seconds"])
+    if plan["segments"] and total - cursor > 0.05:
+        silent.append({"start_seconds": round(cursor, 3), "end_seconds": round(total, 3)})
+    target = (project.get("project") or {}).get("target_duration_seconds")
+    if target and abs(total - target) > 0.2 * target:
+        warnings.append(f"長さ {total:.1f} 秒が目標 {target:.0f} 秒から 20% 以上ずれています。")
+    lines = []
+    if renderer.title:
+        lines.append(f"00:00 タイトル「{title.main}」" + (f" / {title.sub}" if title.sub else "")
+                     + (f" / {title.date}" if title.date else ""))
+    events = [(p["start_seconds"], f"写真 {p['position']} {p['file']}") for p in photos]
+    events += [(m["starts_at"], f"♪ {m['audio']}（写真 {m['start_photo']}〜{m['end_photo']}"
+                + ("・繰り返し" if m.get("repeats") else "") + "）") for m in music if m["sounds"]]
+    lines += [f"{_clock(t)} {text}" for t, text in sorted(events, key=lambda e: e[0])]
+    lines.append(f"{_clock(total)} 終わり")
+    return {"total_seconds": round(total, 3), "target_duration_seconds": target,
+            "title_seconds": round(title_seconds, 3), "seconds_per_photo": round(span, 3),
+            "crossfade_seconds": round(renderer.transition, 3), "photo_count": len(photos),
+            "title": ({"main": title.main, "sub": title.sub, "date": title.date} if renderer.title else None),
+            "photos": photos, "music": music, "silent_ranges": silent if plan["segments"] else [],
+            "warnings": warnings, "lines": lines}
+
+
+def preview_project(project_file, photo_folder, music_folder=None) -> dict:
+    """書き出す前の確認と時間割。写真・曲・計画は読むだけで、何も書かない。"""
+    project = load_project(project_file)
+    try:
+        plan = _check_inputs(project, photo_folder, music_folder)
+    except (TypeError, ValueError) as e:
+        raise CoreError("invalid_project", f"Project JSON の値が読めません: {e}") from None
+    return {"project_file": Path(os.path.abspath(str(project_file))).name, "ready": True,
+            "timeline": build_timeline(project, plan)}
+
+
+def _director_text(plan) -> str:
+    if not isinstance(plan, dict):
+        raise CoreError("invalid_director_plan", "Director Plan は JSON オブジェクトです。")
+    if plan.get("director_version") != DIRECTOR_VERSION:
+        raise CoreError("invalid_director_plan", f"director_version は {DIRECTOR_VERSION} です。")
+    if not isinstance(plan.get("concept"), str) or not plan["concept"].strip():
+        raise CoreError("invalid_director_plan", "concept（どう見せるかの考え）が必要です。")
+    reserved = DIRECTOR_RESERVED & set(plan)
+    if reserved:
+        raise CoreError("invalid_director_plan", f"{sorted(reserved)} は PhotoMovieMaker が書く項目です。")
+    text = json.dumps(plan, ensure_ascii=False)
+    if len(text.encode("utf-8")) > MAX_DIRECTOR_BYTES:
+        raise CoreError("invalid_director_plan", f"Director Plan は {MAX_DIRECTOR_BYTES // 1024} KB までです。")
+    if _ABSOLUTE_PATH.search(text.replace("\\\\", "\\")):
+        raise CoreError("invalid_director_plan",
+                        "Director Plan に絶対パスは書かないでください（ファイル名や論理的な名前で書く）。")
+    return text
+
+
+def _write_json(target: Path, data: dict) -> None:
+    fd, tmp = tempfile.mkstemp(prefix=".pmm_", suffix=".tmp", dir=str(target.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8", newline=chr(10)) as f:
+            f.write(json.dumps(data, ensure_ascii=False, indent=2) + chr(10))
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def director_path(project_file) -> Path:
+    path = Path(os.path.abspath(str(project_file)))
+    stem = path.name[:-len(PROJECT_SUFFIX)] if path.name.endswith(PROJECT_SUFFIX) else path.stem
+    return path.with_name(stem + DIRECTOR_SUFFIX)
+
+
+def save_director_plan(project_file, plan: dict, *, overwrite: bool = False) -> dict:
+    """SI の判断の記録（Director Plan）を、Project の隣に <名前>.director.json として置く。
+
+    PhotoMovieMaker は中身を解釈しない（書き出しには使わない）。形と大きさと、絶対パスが無いことだけを
+    確かめ、計画から計算した時間割（computed）を添える。"""
+    _director_text(plan)
+    project_path = Path(os.path.abspath(str(project_file)))
+    project = load_project(project_path)
+    target = director_path(project_path)
+    if target.exists() and not overwrite:
+        raise CoreError("output_exists", f"同じ名前のファイルがあります: {target}")
+    info = project["project"]
+    try:
+        checked = _check_inputs(project, info["source_folder"], info.get("music_folder"))
+        timeline = build_timeline(project, checked)
+    except CoreError as e:
+        timeline = {"unavailable": f"{e.code}: {e.message}"}
+    shown = shown_files(project)
+    record = {"kind": DIRECTOR_KIND, **plan, "project_file": project_path.name,
+              "saved_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+              "computed": {"photos_in_folder": len(project["media"]), "photos_selected": len(shown),
+                           "photos_excluded": len(project["media"]) - len(shown),
+                           "bgm_tracks": [s["audio"] for s in project["bgm_segments"]],
+                           "timeline": {k: v for k, v in timeline.items() if k != "photos"}}}
+    _write_json(target, record)
+    return {"director_file": str(target), "computed": record["computed"]}
+
+
+def compose_project(folder, edits: dict, save_to, *, music_folder=None, overwrite: bool = False) -> dict:
+    """写真フォルダーから、SI の決めたとおりの Project JSON を新しく組み立てて保存する。
+
+    edits（すべて SI が決める。ここでは選ばない・並べ替えない・足さない）:
+      selected                使う写真のファイル名を上映順に（それ以外は enabled: false）
+      title_card / video / bgm_timing   それぞれの項目の一部（既定値に上書き）
+      bgm_segments            使う写真の何枚目から何枚目までにどの曲（music_folder 直下のファイル名）
+      target_duration_seconds 目標の長さ
+      director                Director Plan（あれば <名前>.director.json として隣に置く）
+    既存の Project は上書きしない（overwrite を指定したときだけ）。写真・曲は読むだけ。"""
+    if not isinstance(edits, dict) or set(edits) - EDIT_KEYS:
+        raise CoreError("invalid_edits", f"edits に使える項目は {sorted(EDIT_KEYS)} です。")
+    if "director" in edits:
+        _director_text(edits["director"])
+    root = resolve_folder(folder)
+    project = create_project_plan(root, title=None)
+    known = {m["file"]: m for m in project["media"]}
+    selected = edits.get("selected")
+    if not isinstance(selected, list) or not selected or not all(isinstance(f, str) for f in selected):
+        raise CoreError("invalid_edits", "selected は使う写真のファイル名の配列（上映順）です。")
+    if len(set(selected)) != len(selected):
+        raise CoreError("invalid_edits", "selected に同じ写真が重複しています。")
+    missing = [f for f in selected if f not in known]
+    if missing:
+        raise CoreError("missing_media", f"フォルダーに無い写真: {missing[:5]}")
+    chosen = set(selected)
+    rest = [m["file"] for m in project["media"] if m["file"] not in chosen]
+    for order, name in enumerate(selected + rest, 1):
+        known[name].update(enabled=name in chosen, order=order)
+    project["media"].sort(key=lambda m: m["order"])
+    for key, cls in (("title_card", app.TitleCard), ("bgm_timing", app.BGMTiming)):
+        change = edits.get(key) or {}
+        if not isinstance(change, dict) or set(change) - set(cls.__dataclass_fields__):
+            raise CoreError("invalid_edits", f"{key} に使える項目は {sorted(cls.__dataclass_fields__)} です。")
+        project[key].update(change)
+    change = edits.get("video") or {}
+    if not isinstance(change, dict) or set(change) - VIDEO_KEYS:
+        raise CoreError("invalid_edits", f"video に使える項目は {sorted(VIDEO_KEYS)} です。")
+    project["video"].update(change)
+    project["project"]["title"] = project["title_card"]["main"]
+    if "target_duration_seconds" in edits:
+        project["project"]["target_duration_seconds"] = edits["target_duration_seconds"]
+    segments = edits.get("bgm_segments") or []
+    project["bgm_segments"] = segments
+    if segments:
+        if not str(music_folder or "").strip():
+            raise CoreError("music_folder_required", "BGM 区間があるので、曲のフォルダー（music_folder）を指定してください。")
+        project["project"]["music_folder"] = str(resolve_folder(music_folder))
+    problems = validate_project(project)
+    if problems:
+        raise CoreError("invalid_project", " / ".join(problems))
+    try:
+        checked = _check_inputs(project, root, music_folder if segments else None)
+    except (TypeError, ValueError) as e:
+        raise CoreError("invalid_project", f"値が読めません: {e}") from None
+    timeline = build_timeline(project, checked)
+    target = Path(os.path.abspath(str(save_to)))
+    if "director" in edits and director_path(target).exists() and not overwrite:
+        raise CoreError("output_exists", f"同じ名前のファイルがあります: {director_path(target)}")
+    saved = save_project(project, target, overwrite=overwrite)
+    result = {"project_file": saved, "director_file": None, "project": project, "timeline": timeline}
+    if "director" in edits:
+        result["director_file"] = save_director_plan(saved, edits["director"], overwrite=True)["director_file"]
+    return result

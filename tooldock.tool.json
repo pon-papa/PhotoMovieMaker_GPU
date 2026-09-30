@@ -24,7 +24,10 @@
     "project_plan",
     "render_final",
     "music_scan",
-    "music_analysis"
+    "music_analysis",
+    "project_compose",
+    "timeline_preview",
+    "director_record"
   ],
   "actions": [
     {
@@ -196,6 +199,72 @@
       "timeout_seconds": 900,
       "cancellable": true,
       "progress": true
+    },
+    {
+      "name": "compose_project",
+      "title": "決めたとおりに Project を組み立てる",
+      "description": "写真フォルダーから新しい Project JSON を組み立てて save_to に保存し、時間割（timeline）を返します。edits_json は JSON オブジェクトの文字列で、selected（使う写真のファイル名を上映順に）・title_card（main / sub / date など）・video（interval_seconds / transition_seconds / camera_mode など）・bgm_timing・bgm_segments（{start_photo, end_photo, audio}: 使う写真の何枚目から何枚目までに、music_folder 直下のどの曲を流すか）・target_duration_seconds・director（Director Plan: 判断の記録。あれば <名前>.director.json として隣に置く）を書けます。ここでは写真を選んだり並べ替えたりしません（決めるのは呼び出し側）。既存の Project は overwrite を指定しない限り上書きしません。写真と曲は読むだけです。",
+      "command": "compose",
+      "access": "write",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder",
+                     "description": "写真のフォルダー（絶対パス）"},
+          "edits_json": {"type": "string", "minLength": 2, "maxLength": 24000, "x-flag": "--edits-json",
+                         "description": "SI の決めたこと（JSON オブジェクトの文字列）"},
+          "save_to": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "output_file",
+                      "x-suffixes": [".photomovie.json"], "x-flag": "--save",
+                      "description": "保存先（*.photomovie.json、output root の中）"},
+          "music_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--music-folder",
+                           "description": "BGM 区間があるときの曲のフォルダー（絶対パス）"},
+          "overwrite": {"type": "boolean", "default": false, "x-flag-true": "--overwrite"}
+        },
+        "required": ["folder", "edits_json", "save_to"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["project_file", "project", "timeline"]},
+      "timeout_seconds": 300
+    },
+    {
+      "name": "preview_project",
+      "title": "書き出す前の確認と時間割",
+      "description": "保存した Project JSON を、書き出すときと同じ規則で確かめ（写真・曲の有無、曲のフォルダーの境界、区間の範囲など）、時間割を返します。時間割には、タイトル・各写真の表示時刻・各曲の鳴り始め・長さ・フェード・曲が区間より短くて繰り返されるかどうか・無音の範囲・目標の長さとのずれ・読みやすい行（00:03 ♪ …）が入ります。何も書きません。",
+      "command": "preview",
+      "access": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project_file": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "project_file",
+                           "x-suffixes": [".photomovie.json"], "x-flag": "--project"},
+          "photo_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder"},
+          "music_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--music-folder"}
+        },
+        "required": ["project_file", "photo_folder"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["ready", "timeline"]},
+      "timeout_seconds": 120
+    },
+    {
+      "name": "save_director_plan",
+      "title": "Director Plan（判断の記録）を保存する",
+      "description": "SI が何をどう判断したか（concept・選んだ写真と外した写真と理由・順序・選んだ曲と選ばなかった曲と理由・曲の区間・タイトル・目標の長さ・事実と推定と不確かさ・制限・計測値など）を、Project の隣に <名前>.director.json として保存します。plan_json は JSON オブジェクトの文字列で、director_version: 1 と concept が必要です。絶対パスは書けません。PhotoMovieMaker は中身を解釈せず、書き出しにも使いません（計画から計算した時間割を computed として添えます）。",
+      "command": "director",
+      "access": "write",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project_file": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "project_file",
+                           "x-suffixes": [".photomovie.json"], "x-flag": "--project"},
+          "plan_json": {"type": "string", "minLength": 2, "maxLength": 24000, "x-flag": "--plan-json"},
+          "overwrite": {"type": "boolean", "default": false, "x-flag-true": "--overwrite"}
+        },
+        "required": ["project_file", "plan_json"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["director_file", "computed"]},
+      "timeout_seconds": 120
     }
   ],
   "health_check": {"action": "get_capabilities"},
