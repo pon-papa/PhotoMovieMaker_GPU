@@ -4,7 +4,7 @@
   "name": "PhotoMovieMaker GPU",
   "version": "0.1.1+external-api",
   "api_version": 1,
-  "description": "写真フォルダーからMP4スライドショーを作るローカルツール。写真の解析・代替候補グループ・上映計画（Project JSON）をCLIから利用できます。元の写真は読むだけです。",
+  "description": "写真フォルダーからMP4スライドショーを作るローカルツール。写真の解析・代替候補グループ・上映計画（Project JSON）・計画どおりの MP4 書き出しをCLIから利用できます。元の写真は読むだけです。",
   "namespace": "slideshow",
   "interface": {
     "type": "json_cli",
@@ -21,7 +21,8 @@
     "variant_family",
     "candidate_group",
     "subject_detection",
-    "project_plan"
+    "project_plan",
+    "render_final"
   ],
   "actions": [
     {
@@ -126,6 +127,34 @@
       },
       "output_schema": {"type": "object", "required": ["project", "valid"]},
       "timeout_seconds": 60
+    },
+    {
+      "name": "render",
+      "title": "MP4 を書き出す",
+      "description": "保存した Project JSON（上映計画）のとおりに、画面と同じ処理で MP4 スライドショーを書き出します。使うのは enabled が true の写真だけで、order の順に並びます。video（解像度・秒数・カメラワーク）と title_card も計画どおりです。BGM 付きの書き出しはまだできません（bgm_segments は空にしてください）。photo_folder は計画の source_folder と同じフォルダーを指定します。写真と計画ファイルは読むだけです。完成した MP4 と *_settings.json だけを書き出し先に置き、中止・失敗のときは何も残しません。同じ名前のファイルは overwrite を指定しない限り上書きしません。写真の枚数と解像度しだいで数十秒〜数分かかります。",
+      "command": "render",
+      "access": "write",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "project_file": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "project_file",
+                           "x-suffixes": [".photomovie.json"], "x-flag": "--project",
+                           "description": "Project ファイル（絶対パス、*.photomovie.json）"},
+          "photo_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder",
+                           "description": "写真のフォルダー（計画の source_folder と同じ、絶対パス）"},
+          "output_file": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "output_file",
+                          "x-suffixes": [".mp4"], "x-flag": "--output",
+                          "description": "書き出す MP4（絶対パス）"},
+          "overwrite": {"type": "boolean", "default": false, "x-flag-true": "--overwrite"}
+        },
+        "required": ["project_file", "photo_folder", "output_file"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["output", "bytes", "photos", "frames", "duration_seconds", "encoder_used"],
+                        "properties": {"output": {"type": "string"}, "frames": {"type": "integer"}}},
+      "timeout_seconds": 3600,
+      "cancellable": true,
+      "progress": true
     }
   ],
   "health_check": {"action": "get_capabilities"},

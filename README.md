@@ -440,6 +440,7 @@ py -3 pmm_cli.py scan --folder "C:\写真\広島旅行"
 py -3 pmm_cli.py analyze --folder "C:\写真\広島旅行"
 py -3 pmm_cli.py plan --folder "C:\写真\広島旅行" --title "広島旅行" --analyze --save "C:\計画\広島.photomovie.json"
 py -3 pmm_cli.py validate --project "C:\計画\広島.photomovie.json"
+py -3 pmm_cli.py render --project "C:\計画\広島.photomovie.json" --folder "C:\写真\広島旅行" --output "C:\動画\広島.mp4"
 ```
 
 | コマンド | 内容 |
@@ -449,6 +450,7 @@ py -3 pmm_cli.py validate --project "C:\計画\広島.photomovie.json"
 | `analyze` | おすすめ解析（代替候補グループ・同じ写真の別バージョン・推奨度・人物/犬の数・撮影時刻） |
 | `plan` | Project JSON（上映計画）の叩き台 |
 | `validate` | Project JSON が正しい形かの確認 |
+| `render` | Project JSON のとおりに MP4 を書き出す（画面と同じ処理） |
 
 終了コードは 0=成功 / 1=処理できなかった / 2=使い方の誤り / 130=中止 です。
 エラーのときも JSON（`"ok": false` と `error.code`）を返します。
@@ -456,7 +458,13 @@ py -3 pmm_cli.py validate --project "C:\計画\広島.photomovie.json"
 - 元の写真は**読むだけ**です。削除・移動・名前の変更・上書きはしません
 - フォルダーの**直下だけ**を見ます。サブフォルダーやドライブ全体は探しません
 - 通信はしません。モデルを実行時にダウンロードすることもありません
-- 画面から作る動画・BGM・タイトルカードは、今はまだ CLI から書き出せません（次の段階）
+- `render` は画面と同じ `VideoRenderer` で書き出します。同じ設定なら、画面から作った MP4 と同じものになります
+  - 使うのは `enabled: true` の写真だけで、`order` の順に並びます。`video` と `title_card`（被写体追従カメラを含む）は計画どおりです
+  - `--folder` には計画の `source_folder` と同じフォルダーを指定します。写真のフォルダーの中には書き出しません
+  - 書き出しは一時フォルダーで行い、完成した MP4 と `*_settings.json` だけを置きます。中止・失敗のときは何も残しません
+  - 同じ名前のファイルは `--overwrite` を付けない限り上書きしません
+  - BGM 付きの書き出しは、まだ画面からだけです（`bgm_segments` は空にしてください）
+- 環境変数 `TOOLDOCK_CANCEL_FILE` が指すファイルが現れると、解析・書き出しを安全に止めます（自動化から使うときだけ。画面には関係しません）
 
 ### Project JSON（上映計画）
 

@@ -9,15 +9,20 @@ ToolDock の MCP Sidecar は、このコマンドを通して PhotoMovieMaker �
     py -3 pmm_cli.py analyze --folder "C:\\写真\\旅行" [--no-embedding] [--no-subjects]
     py -3 pmm_cli.py plan --folder "C:\\写真\\旅行" [--title 題名] [--analyze] [--save 計画.photomovie.json]
     py -3 pmm_cli.py validate --project 計画.photomovie.json
+    py -3 pmm_cli.py render --project 計画.photomovie.json --folder "C:\\写真\\旅行" --output 旅行.mp4 [--overwrite]
 
 終了コード: 0=成功 / 1=処理できなかった / 2=使い方の誤り / 130=中止
 元の写真は読むだけで、書き換えません。
+
+中止: 環境変数 TOOLDOCK_CANCEL_FILE が指すファイルが現れたら、処理を安全に止める
+（呼び出し側が作る。ToolDock などの自動化から使うときだけ。画面には関係しない）。
 """
 
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 
 OUTPUT_FORMAT = 1
@@ -53,7 +58,18 @@ def build_parser() -> argparse.ArgumentParser:
     pl.add_argument("--overwrite", action="store_true")
     v = sub.add_parser("validate", help="Project JSON を確かめる")
     v.add_argument("--project", required=True)
+    r = sub.add_parser("render", help="Project JSON から MP4 を書き出す")
+    r.add_argument("--project", required=True)
+    r.add_argument("--folder", required=True)
+    r.add_argument("--output", required=True)
+    r.add_argument("--overwrite", action="store_true")
     return p
+
+
+def should_stop() -> bool:
+    """呼び出し側が中止ファイルを置いたら True（TOOLDOCK_CANCEL_FILE が無ければ常に False）。"""
+    marker = os.environ.get("TOOLDOCK_CANCEL_FILE")
+    return bool(marker) and os.path.exists(marker)
 
 
 def emit(payload: dict) -> None:
@@ -87,17 +103,22 @@ def run(argv: list[str]) -> int:
         elif args.command == "analyze":
             result = core.analyze_photos(args.folder, use_embedding=not args.no_embedding,
                                          detect_subjects=not args.no_subjects,
-                                         progress=progress)
+                                         progress=progress, should_stop=should_stop)
         elif args.command == "plan":
             result = core.create_project_plan(
                 args.folder, title=args.title, analyze=args.analyze,
                 use_embedding=not args.no_embedding, detect_subjects=not args.no_subjects,
-                target_duration_seconds=args.target_duration, progress=progress)
+                target_duration_seconds=args.target_duration, progress=progress,
+                should_stop=should_stop)
             if args.save:
                 saved = core.save_project(result, args.save, overwrite=args.overwrite)
                 result = {"project": result, "saved_to": saved}
             else:
                 result = {"project": result, "saved_to": None}
+        elif args.command == "render":
+            result = core.render_project(args.project, args.folder, args.output,
+                                         overwrite=args.overwrite, progress=progress,
+                                         should_stop=should_stop)
         else:  # validate
             result = {"project": core.load_project(args.project), "valid": True}
     except core.CancelledError as e:
