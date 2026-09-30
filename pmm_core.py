@@ -64,6 +64,10 @@ DEFAULT_VIDEO = {
 ENCODER_CHOICES = {"auto", "nvenc", "cpu"}
 CAMERA_MODES = {app.CAMERA_LEGACY, app.CAMERA_SUBJECT}
 MEDIA_TYPES = {"image", "video"}        # video は将来用（今はまだ描画できない）
+# 曲の形式は、画面の曲選択（AUDIO_FILETYPES の絞り込み）と同じものだけ
+AUDIO_SUFFIXES = frozenset(pattern[1:].lower() for pattern in app.AUDIO_FILETYPES[0][1].split())
+# Project JSON の BGM 区間の項目。*_settings.json の bgm_segments と同じ名前（audio はファイル名だけ）
+SEGMENT_KEYS = {"start_photo", "end_photo", "audio", "start_file", "end_file"}
 
 
 class CoreError(Exception):
@@ -359,6 +363,8 @@ def create_project_plan(folder, *, title: str | None = None, analysis: dict | No
             "title": title_card["main"],
             "source_folder": str(root),
             "target_duration_seconds": target_duration_seconds,
+            # BGM を使うときだけ、曲のフォルダー（書き出しのときに同じものを渡す）
+            "music_folder": None,
         },
         "media": media,
         # 以下の区画名と中身は、動画を作ったときに書き出す *_settings.json と同じ。
@@ -382,6 +388,68 @@ def create_project_plan(folder, *, title: str | None = None, analysis: dict | No
 
 def _number(value, lo, hi) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool) and lo <= value <= hi
+
+
+def _plain_name(name) -> bool:
+    """フォルダー直下のファイル名だけか（区切り文字・ドライブ・.. を含まない）。"""
+    return (isinstance(name, str) and bool(name) and name not in {".", ".."}
+            and not any(c in name for c in "\\/:") and name == name.strip())
+
+
+def _position(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 1
+
+
+def shown_files(project: dict) -> list[str]:
+    """使う写真（enabled）を上映順に並べたファイル名。BGM 区間の「何枚目」はこの並び。"""
+    media = [m for m in project.get("media") or [] if isinstance(m, dict) and m.get("enabled") is True
+             and _position(m.get("order"))]
+    return [m["file"] for m in sorted(media, key=lambda m: m["order"])]
+
+
+def _validate_segments(project: dict, problems: list[str]) -> None:
+    segments = project.get("bgm_segments")
+    if not isinstance(segments, list):
+        problems.append("bgm_segments は配列である必要があります。")
+        return
+    info = project.get("project") if isinstance(project.get("project"), dict) else {}
+    music = info.get("music_folder")
+    if music is not None and (not isinstance(music, str) or not os.path.isabs(music)):
+        problems.append("project.music_folder は曲のフォルダーの絶対パスです。")
+    if not segments:
+        return
+    if not isinstance(music, str) or not music:
+        problems.append("bgm_segments があるときは project.music_folder（曲のフォルダーの絶対パス）が必要です。")
+    shown = shown_files(project)
+    spans = []
+    for i, s in enumerate(segments, 1):
+        where = f"bgm_segments[{i}]"
+        if not isinstance(s, dict) or set(s) - SEGMENT_KEYS:
+            problems.append(f"{where} の項目が不正です（使える項目: {sorted(SEGMENT_KEYS)}）。")
+            continue
+        audio = s.get("audio")
+        if not _plain_name(audio):
+            problems.append(f"{where}.audio は曲のフォルダーの中のファイル名だけを指定してください。")
+        elif Path(audio).suffix.lower() not in AUDIO_SUFFIXES:
+            problems.append(f"{where}.audio の形式には対応していません（{' '.join(sorted(AUDIO_SUFFIXES))}）。")
+        first, last = s.get("start_photo"), s.get("end_photo")
+        if not _position(first) or not _position(last):
+            problems.append(f"{where}.start_photo / end_photo は 1 以上の整数（使う写真の上映順で何枚目か）です。")
+            continue
+        if first > last:
+            problems.append(f"{where}: start_photo は end_photo 以下にしてください。")
+            continue
+        if last > len(shown):
+            problems.append(f"{where}: 使う写真は {len(shown)} 枚です（end_photo {last}）。")
+            continue
+        for key, position in (("start_file", first), ("end_file", last)):
+            if key in s and s[key] != shown[position - 1]:
+                problems.append(f"{where}.{key} が {position} 枚目の写真（{shown[position - 1]}）と違います。")
+        spans.append((first, last, i))
+    spans.sort()
+    for (a_first, a_last, a), (b_first, _b_last, b) in zip(spans, spans[1:]):
+        if b_first <= a_last:
+            problems.append(f"bgm_segments[{a}] と bgm_segments[{b}] の写真の範囲が重なっています。")
 
 
 def validate_project(project) -> list[str]:
@@ -416,8 +484,7 @@ def validate_project(project) -> list[str]:
             continue
         name = m.get("file")
         # ファイル名だけを許す。フォルダーの外を指すものは受け付けない。
-        if (not isinstance(name, str) or not name or name in {".", ".."}
-                or any(c in name for c in "\\/:") or name != name.strip()):
+        if not _plain_name(name):
             problems.append(f"media[{i}].file はファイル名だけを指定してください。")
         elif name in files:
             problems.append(f"media[{i}].file が重複しています: {name}")
@@ -457,8 +524,7 @@ def validate_project(project) -> list[str]:
         known = set(cls.__dataclass_fields__)
         if not isinstance(block, dict) or set(block) - known:
             problems.append(f"{key} の項目が不正です（使える項目: {sorted(known)}）。")
-    if not isinstance(project.get("bgm_segments"), list):
-        problems.append("bgm_segments は配列である必要があります。")
+    _validate_segments(project, problems)
     return problems
 
 
@@ -515,6 +581,40 @@ def _is_inside(path: Path, folder: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def resolve_bgm(project: dict, music_folder) -> tuple[Path | None, list]:
+    """Project の BGM 区間を、確かめたうえで renderer の区間（BGMSegment）にする。ここでは何も書かない。
+
+    曲は、呼び出し側が明示した曲のフォルダー（music_folder）の直下にあるものだけ。
+    Project JSON に書かれた場所をそのまま信じない:
+      - music_folder は Project の project.music_folder と同じフォルダーであること
+      - 曲はそのフォルダー直下のファイル名だけ（形式は画面の曲選択と同じ）
+      - 実体がフォルダーの外にあるもの（リンク）は使わない
+    """
+    segments = sorted(project.get("bgm_segments") or [], key=lambda s: s["start_photo"])
+    if not segments:
+        return None, []
+    if not str(music_folder or "").strip():
+        raise CoreError("music_folder_required",
+                        "BGM 区間があるので、曲のフォルダー（music_folder）を指定してください。")
+    root = resolve_folder(music_folder)
+    declared = Path(os.path.abspath(project["project"]["music_folder"]))
+    if os.path.normcase(str(declared)) != os.path.normcase(str(root)):
+        raise CoreError("folder_mismatch",
+                        f"music_folder が Project JSON の music_folder と違います: {root} / {declared}")
+    real_root = os.path.normcase(os.path.realpath(root))
+    result = []
+    for s in segments:
+        path = root / s["audio"]
+        if path.suffix.lower() not in AUDIO_SUFFIXES:
+            raise CoreError("unsupported_audio", f"{s['audio']}: 対応していない曲の形式です。")
+        if not path.is_file():
+            raise CoreError("missing_audio", f"曲が見つかりません: {s['audio']}")
+        if os.path.normcase(os.path.dirname(os.path.realpath(path))) != real_root:
+            raise CoreError("invalid_audio", f"{s['audio']}: 曲のフォルダーの外を指すリンクは使えません。")
+        result.append(app.BGMSegment(s["start_photo"] - 1, s["end_photo"] - 1, path))
+    return root, result
 
 
 def _render_plan(project: dict, photo_folder, output_file) -> dict:
