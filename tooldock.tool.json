@@ -133,7 +133,7 @@
     {
       "name": "render",
       "title": "MP4 を書き出す",
-      "description": "保存した Project JSON（上映計画）のとおりに、画面と同じ処理で MP4 スライドショーを書き出します。使うのは enabled が true の写真だけで、order の順に並びます。video（解像度・秒数・カメラワーク）と title_card も計画どおりです。BGM 付きの書き出しはまだできません（bgm_segments は空にしてください）。photo_folder は計画の source_folder と同じフォルダーを指定します。写真と計画ファイルは読むだけです。完成した MP4 と *_settings.json だけを書き出し先に置き、中止・失敗のときは何も残しません。同じ名前のファイルは overwrite を指定しない限り上書きしません。写真の枚数と解像度しだいで数十秒〜数分かかります。",
+      "description": "保存した Project JSON（上映計画）のとおりに、画面と同じ処理で MP4 スライドショーを書き出します。使うのは enabled が true の写真だけで、order の順に並びます。video（解像度・秒数・カメラワーク）と title_card も計画どおりです。bgm_segments（使う写真の何枚目から何枚目までにどの曲を流すか）と bgm_timing があれば、画面と同じ仕組みで BGM を合成します。そのときは music_folder に計画の music_folder と同じフォルダーを指定し、曲はその直下のものだけが使われます。photo_folder は計画の source_folder と同じフォルダーを指定します。写真・曲・計画ファイルは読むだけです。完成した MP4 と *_settings.json だけを書き出し先に置き、中止・失敗のときは何も残しません。同じ名前のファイルは overwrite を指定しない限り上書きしません。写真の枚数と解像度しだいで数十秒〜数分かかります。",
       "command": "render",
       "access": "write",
       "input_schema": {
@@ -147,7 +147,9 @@
           "output_file": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "output_file",
                           "x-suffixes": [".mp4"], "x-flag": "--output",
                           "description": "書き出す MP4（絶対パス）"},
-          "overwrite": {"type": "boolean", "default": false, "x-flag-true": "--overwrite"}
+          "overwrite": {"type": "boolean", "default": false, "x-flag-true": "--overwrite"},
+          "music_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--music-folder",
+                           "description": "BGM 区間があるときの曲のフォルダー（計画の music_folder と同じ、絶対パス）。曲はこの直下のものだけを使う"}
         },
         "required": ["project_file", "photo_folder", "output_file"],
         "additionalProperties": false

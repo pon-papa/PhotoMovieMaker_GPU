@@ -66,6 +66,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--folder", required=True)
     r.add_argument("--output", required=True)
     r.add_argument("--overwrite", action="store_true")
+    r.add_argument("--music-folder", help="BGM 区間があるときの曲のフォルダー（計画の music_folder と同じ）")
     ms = sub.add_parser("music-scan", help="曲のフォルダー直下の曲を一覧にする")
     ms.add_argument("--folder", required=True)
     ma = sub.add_parser("music-analyze", help="曲を技術的に測る（長さ・音量の推移・無音など）")
@@ -128,8 +129,8 @@ def run(argv: list[str]) -> int:
             result = core.analyze_music(args.folder, progress=progress, should_stop=should_stop)
         elif args.command == "render":
             result = core.render_project(args.project, args.folder, args.output,
-                                         overwrite=args.overwrite, progress=progress,
-                                         should_stop=should_stop)
+                                         overwrite=args.overwrite, music_folder=args.music_folder,
+                                         progress=progress, should_stop=should_stop)
         else:  # validate
             result = {"project": core.load_project(args.project), "valid": True}
     except core.CancelledError as e:

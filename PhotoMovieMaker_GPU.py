@@ -935,13 +935,36 @@ class VideoRenderer:
         self.q.put(("status", "BGMを合成しています…"))
 
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
-        r = subprocess.run(
+        proc = subprocess.Popen(
             cmd,
-            capture_output=True, text=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
             creationflags=creationflags,
         )
-        if r.returncode != 0:
-            raise RuntimeError("BGM合成失敗:\n" + (r.stderr or "")[-5000:])
+        errors: list[bytes] = []
+        reader = threading.Thread(target=lambda: errors.append(proc.stderr.read()), daemon=True)
+        reader.start()
+        # 合成の最中も中止できるようにする（映像の描画と同じ stop_event を見る）。
+        # 止めたら FFmpeg を終わらせ、作りかけのファイルは残さない。
+        try:
+            while proc.poll() is None:
+                if self.stop_event.wait(0.1):
+                    proc.kill()
+                    proc.wait(timeout=15)
+                    reader.join(timeout=5)
+                    try:
+                        self.output.unlink()
+                    except OSError:
+                        pass
+                    raise InterruptedError("処理を中止しました。")
+            reader.join(timeout=5)
+        finally:
+            try:
+                proc.stderr.close()
+            except OSError:
+                pass
+        if proc.returncode != 0:
+            stderr = b"".join(errors).decode("utf-8", errors="replace")
+            raise RuntimeError("BGM合成失敗:\n" + stderr[-5000:])
 
     def settings_path(self) -> Path:
         """作った動画の隣に置く設定ファイルのパス。"""

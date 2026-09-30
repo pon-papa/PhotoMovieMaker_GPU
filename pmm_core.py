@@ -177,9 +177,9 @@ def get_capabilities() -> dict:
         ],
         "planned": ["render_preview", "transition_primitives",
                     "video_clips", "beat_aligned_plan"],
-        # render は Project JSON の title_card と camera_mode（被写体追従）を使う。
-        # BGM はまだ画面からだけ（音声ファイルの場所を安全に受け取る方法を決めてから）。
-        "gui_only": ["bgm"],
+        # render は Project JSON の title_card・camera_mode（被写体追従）・BGM 区間を使う。
+        # 曲は呼び出し側が明示した曲のフォルダー（music_folder）の直下だけ。
+        "gui_only": [],
         "media": {"image_extensions": sorted(app.SUPPORTED_IMAGES),
                   "video_extensions": [], "audio_extensions": sorted(AUDIO_SUFFIXES),
                   "recursive": False},
@@ -819,7 +819,7 @@ def resolve_bgm(project: dict, music_folder) -> tuple[Path | None, list]:
     return root, result
 
 
-def _render_plan(project: dict, photo_folder, output_file) -> dict:
+def _render_plan(project: dict, photo_folder, output_file, music_folder=None) -> dict:
     """render の前に、計画と書き出し先を確かめる。ここでは何も書かない。"""
     root = resolve_folder(photo_folder)
     declared = Path(os.path.abspath(project["project"]["source_folder"]))
@@ -842,9 +842,8 @@ def _render_plan(project: dict, photo_folder, output_file) -> dict:
             raise CoreError("missing_media", f"写真が見つかりません: {m['file']}")
         images.append(path)
 
-    if project["bgm_segments"]:
-        raise CoreError("bgm_not_supported",
-                        "BGM 付きの書き出しは、まだ画面からだけです（bgm_segments を空にしてください）。")
+    # BGM: 曲は呼び出し側が明示した曲のフォルダーの中だけ（resolve_bgm）。区間は画面と同じ BGMSegment
+    music_root, segments = resolve_bgm(project, music_folder)
 
     video = project["video"]
     if video["transition_seconds"] >= video["interval_seconds"]:
@@ -868,9 +867,11 @@ def _render_plan(project: dict, photo_folder, output_file) -> dict:
         raise CoreError("invalid_output", f"書き出し先のフォルダーがありません: {target.parent}")
     if _is_inside(target, root):
         raise CoreError("invalid_output", "写真のフォルダーの中には書き出しません（元の写真を守るため）。")
+    if music_root is not None and _is_inside(target, music_root):
+        raise CoreError("invalid_output", "曲のフォルダーの中には書き出しません（元の曲を守るため）。")
     settings = target.with_name(target.stem + "_settings.json")
     return {"root": root, "images": images, "video": video, "title": title,
-            "timing": timing, "target": target, "settings": settings}
+            "timing": timing, "target": target, "settings": settings, "segments": segments}
 
 
 def _place(source: Path, target: Path) -> None:
@@ -889,10 +890,12 @@ def _place(source: Path, target: Path) -> None:
 
 
 def render_project(project_file, photo_folder, output_file, *, overwrite: bool = False,
-                   progress=None, should_stop=None) -> dict:
+                   music_folder=None, progress=None, should_stop=None) -> dict:
     """Project JSON（上映計画）から、画面と同じ VideoRenderer で MP4 を書き出す。
 
-    - Project JSON と写真は読むだけ
+    - Project JSON・写真・曲は読むだけ
+    - BGM 区間があるときは music_folder（曲のフォルダー）が要る。曲はその直下のものだけ
+      （resolve_bgm）。曲の合成は画面と同じ VideoRenderer.mux_bgm が行う
     - 書き出しは OS の一時フォルダーで行い、完成した MP4 と *_settings.json だけを
       書き出し先へ置く。中止・失敗のときは書き出し先に何も残さない
     - 同じ名前があれば overwrite を指定しない限り書かない
@@ -902,7 +905,7 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
     project_path = Path(os.path.abspath(str(project_file)))
     project = load_project(project_path)
     try:
-        plan = _render_plan(project, photo_folder, output_file)
+        plan = _render_plan(project, photo_folder, output_file, music_folder)
     except (TypeError, ValueError) as e:     # 型の合わない値（例: 秒数が文字列）
         raise CoreError("invalid_project", f"Project JSON の値が読めません: {e}") from None
     target, settings_file = plan["target"], plan["settings"]
@@ -925,7 +928,7 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
             transition_seconds=float(video["transition_seconds"]),
             zoom_percent=float(video["zoom_percent"]),
             blur_background=bool(video["blur_background"]),
-            bgm_segments=[],
+            bgm_segments=plan["segments"],
             encoder_pref=video["encoder_choice"],
             q=q, stop_event=stop_event,
             title=plan["title"], bgm_timing=plan["timing"],
@@ -1009,6 +1012,7 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
         "camera_mode": renderer.camera_mode,
         "subject_camera": detections or None,
         "title_card": bool(renderer.title),
+        "bgm_tracks": [s.audio_path.name for s in plan["segments"]],
         "encoder_used": renderer.encoder_used,
         "elapsed_seconds": round(time.perf_counter() - started, 1),
         "warnings": warnings,
