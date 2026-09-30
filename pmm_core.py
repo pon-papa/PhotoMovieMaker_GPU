@@ -16,8 +16,11 @@ Tk の画面は一切作りません。
 from __future__ import annotations
 
 import json
+import math
 import os
+import re
 import shutil
+import subprocess
 import tempfile
 import threading
 import time
@@ -26,6 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from queue import Empty, Queue
 
+import numpy as np
 from PIL import Image
 
 # 画面の部品（Tk）はここでは作らない。定数と描画用の設定クラスだけを借りる。
@@ -168,6 +172,8 @@ def get_capabilities() -> dict:
             "subject_detection",
             "project_plan",
             "render_final",
+            "music_scan",
+            "music_analysis",
         ],
         "planned": ["render_preview", "transition_primitives",
                     "video_clips", "beat_aligned_plan"],
@@ -175,7 +181,8 @@ def get_capabilities() -> dict:
         # BGM はまだ画面からだけ（音声ファイルの場所を安全に受け取る方法を決めてから）。
         "gui_only": ["bgm"],
         "media": {"image_extensions": sorted(app.SUPPORTED_IMAGES),
-                  "video_extensions": [], "recursive": False},
+                  "video_extensions": [], "audio_extensions": sorted(AUDIO_SUFFIXES),
+                  "recursive": False},
         "models": {"embedding": embedding_ready, "subject_detection": detector_ready},
         "project": {"kind": PROJECT_KIND, "schema_version": PROJECT_SCHEMA_VERSION,
                     "file_suffix": PROJECT_SUFFIX},
@@ -312,6 +319,201 @@ def analyze_photos(folder, *, use_embedding: bool = True, detect_subjects: bool 
             "variant_family": "同じ1枚の写真の別バージョン（カラー版と白黒版、コピーなど）",
             "stars": "同じ群の中での推奨度。写真の価値や良し悪しではない",
         },
+    }
+
+
+# ------------------------------------------------------------------
+# 曲（BGM の候補）: 一覧と技術的な測定。曲は読むだけ
+# ------------------------------------------------------------------
+
+MAX_TRACKS = 30
+ANALYSIS_RATE = 8000        # 音量の推移を測るために mono へまとめるときのサンプルレート
+SILENCE_DB = -50.0          # 1 秒の RMS がこれ未満なら「無音」
+QUIET_BELOW_DB = 18.0       # 曲全体の RMS よりこれだけ小さい 1 秒が 3 秒以上続けば「静かな区間」
+
+
+def _run_tool(command: list[str], *, timeout: float = 300, binary: bool = False):
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    try:
+        return subprocess.run(command, capture_output=True, text=not binary, timeout=timeout,
+                              creationflags=flags, **({} if binary else {"encoding": "utf-8", "errors": "replace"}))
+    except subprocess.TimeoutExpired:
+        raise CoreError("analysis_failed", f"{timeout:.0f} 秒以内に終わりませんでした。") from None
+    except OSError as e:
+        raise CoreError("analysis_failed", f"FFmpeg を起動できません: {e}") from None
+
+
+def find_ffprobe() -> str | None:
+    """ffprobe（PATH のもの、無ければ画面と同じ FFmpeg の隣）。無ければ None。"""
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    beside = Path(app.find_ffmpeg()).with_name("ffprobe" + (".exe" if os.name == "nt" else ""))
+    return str(beside) if beside.is_file() else None
+
+
+def list_tracks(folder: Path) -> list[Path]:
+    """フォルダー直下の曲を、写真と同じ番号の自然順で返す（形式は画面の曲選択と同じ）。"""
+    try:
+        entries = list(folder.iterdir())
+    except OSError as e:
+        raise CoreError("unreadable_folder", f"フォルダーを読み取れません: {e}") from None
+    return sorted((p for p in entries if p.is_file() and p.suffix.lower() in AUDIO_SUFFIXES),
+                  key=app.natural_key)
+
+
+def scan_music(folder) -> dict:
+    """曲のフォルダー直下の曲を一覧にする。中身は読まない。"""
+    root = resolve_folder(folder)
+    tracks = list_tracks(root)
+    others = 0
+    try:
+        others = sum(1 for p in root.iterdir() if p.is_file()) - len(tracks)
+    except OSError:
+        pass
+    return {"folder": str(root), "count": len(tracks),
+            "tracks": [{"file": p.name, "format": p.suffix.lower()[1:], "bytes": p.stat().st_size,
+                        "modified": _iso(p.stat().st_mtime)} for p in tracks],
+            "skipped_files": max(0, others), "formats": sorted(AUDIO_SUFFIXES)}
+
+
+def _probe_track(ffprobe: str | None, path: Path) -> dict:
+    if not ffprobe:
+        return {}
+    r = _run_tool([ffprobe, "-v", "error", "-print_format", "json", "-show_format", "-show_streams",
+                   "-select_streams", "a:0", str(path)], timeout=60)
+    try:
+        data = json.loads(r.stdout or "{}")
+    except ValueError:
+        return {}
+    fmt, streams = data.get("format") or {}, data.get("streams") or []
+    stream = streams[0] if streams else {}
+    tags = {k.lower(): v for k, v in (fmt.get("tags") or {}).items()}
+
+    def number(value, kind=float):
+        try:
+            return kind(value)
+        except (TypeError, ValueError):
+            return None
+
+    return {
+        "container": fmt.get("format_name"),
+        "codec": stream.get("codec_name"),
+        "sample_rate": number(stream.get("sample_rate"), int),
+        "channels": number(stream.get("channels"), int),
+        "channel_layout": stream.get("channel_layout"),
+        "bit_rate": number(fmt.get("bit_rate"), int),
+        "probe_duration_seconds": number(fmt.get("duration")),
+        "tags": {k: str(tags[k])[:200] for k in ("title", "artist", "album", "genre", "date") if k in tags},
+    }
+
+
+def _loudness(ffmpeg: str, path: Path) -> dict:
+    """EBU R128（FFmpeg の ebur128）: 統合ラウドネス・ラウドネスレンジ・トゥルーピーク。"""
+    r = _run_tool([ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-vn",
+                   "-af", "ebur128=peak=true", "-f", "null", "-"])
+    text = (r.stderr or "")
+    summary = text[text.rfind("Summary:"):] if "Summary:" in text else ""
+
+    def pick(label):
+        m = re.search(label + r":\s*(-?[\d.]+|-inf)", summary)
+        if not m:
+            return None
+        return None if m.group(1) == "-inf" else round(float(m.group(1)), 1)
+
+    return {"integrated_lufs": pick("I"), "loudness_range_lu": pick("LRA"), "true_peak_dbfs": pick("Peak")}
+
+
+def _decode_mono(ffmpeg: str, path: Path):
+    r = _run_tool([ffmpeg, "-hide_banner", "-loglevel", "error", "-i", str(path), "-vn", "-ac", "1",
+                   "-ar", str(ANALYSIS_RATE), "-f", "f32le", "-"], binary=True)
+    if r.returncode != 0:
+        raise CoreError("analysis_failed", f"{path.name}: 曲を読めませんでした。")
+    return np.frombuffer(r.stdout, dtype="<f4")
+
+
+def _db(value: float) -> float | None:
+    return round(20 * math.log10(value), 1) if value > 1e-10 else None
+
+
+def _runs(flags, minimum: int) -> list[dict]:
+    found, start = [], None
+    for i, flag in enumerate(list(flags) + [False]):
+        if flag and start is None:
+            start = i
+        elif not flag and start is not None:
+            if i - start >= minimum:
+                found.append({"start_seconds": start, "end_seconds": i})
+            start = None
+    return found
+
+
+def _envelope(samples) -> dict:
+    seconds = int(len(samples) // ANALYSIS_RATE)
+    if seconds == 0:
+        return {"per_second_rms_dbfs": [], "peak_dbfs": _db(float(np.max(np.abs(samples)))) if len(samples) else None,
+                "rms_dbfs": None, "silences": [], "quiet_sections": [], "leading_silence_seconds": 0,
+                "trailing_silence_seconds": 0, "energy_profile": []}
+    frames = samples[:seconds * ANALYSIS_RATE].reshape(seconds, ANALYSIS_RATE).astype(np.float64)
+    rms = np.sqrt(np.mean(frames * frames, axis=1))
+    db = [(_db(float(v)) if v > 1e-10 else -120.0) for v in rms]
+    overall = _db(float(np.sqrt(np.mean(samples.astype(np.float64) ** 2))))
+    silent = [d < SILENCE_DB for d in db]
+    lead = next((i for i, s in enumerate(silent) if not s), seconds)
+    trail = next((i for i, s in enumerate(reversed(silent)) if not s), seconds)
+    quiet = [d < (overall - QUIET_BELOW_DB) for d in db] if overall is not None else [False] * seconds
+    bins = min(10, seconds)
+    profile = []
+    for k in range(bins):
+        a, b = k * seconds // bins, (k + 1) * seconds // bins
+        chunk = rms[a:b]
+        profile.append({"start_seconds": a, "end_seconds": b,
+                        "rms_dbfs": _db(float(np.sqrt(np.mean(chunk * chunk)))) if len(chunk) else None})
+    return {"per_second_rms_dbfs": db, "rms_dbfs": overall,
+            "peak_dbfs": _db(float(np.max(np.abs(samples)))),
+            "silences": _runs(silent, 1), "quiet_sections": _runs(quiet, 3),
+            "leading_silence_seconds": lead, "trailing_silence_seconds": trail,
+            "energy_profile": profile}
+
+
+def analyze_music(folder, *, progress=None, should_stop=None) -> dict:
+    """曲のフォルダー直下の曲を、技術的に測れることだけ測る。曲は読むだけ。
+
+    測る: 長さ・形式・サンプルレート・チャンネル・ビットレート・ファイルのメタデータ（書かれていれば）・
+    統合ラウドネス・トゥルーピーク・1 秒ごとの音量の推移・無音・静かな区間・10 区分の音量の概形。
+    測らない（unknown）: テンポ（BPM）・拍・曲の雰囲気。雰囲気の推定は呼び出し側（SI）の判断で、事実ではない。
+    """
+    root = resolve_folder(folder)
+    tracks = list_tracks(root)
+    if len(tracks) > MAX_TRACKS:
+        raise CoreError("too_many_tracks", f"曲は {MAX_TRACKS} 曲までにしてください（{len(tracks)} 曲あります）。")
+    stop = should_stop or (lambda: False)
+    ffmpeg, ffprobe = app.find_ffmpeg(), find_ffprobe()
+    results = []
+    for index, path in enumerate(tracks, 1):
+        if stop():
+            raise CancelledError()
+        if progress:
+            progress("music", index - 1, len(tracks))
+        samples = _decode_mono(ffmpeg, path)
+        entry = {"file": path.name, "format": path.suffix.lower()[1:],
+                 "duration_seconds": round(len(samples) / ANALYSIS_RATE, 2)}
+        entry.update(_probe_track(ffprobe, path))
+        entry["loudness"] = _loudness(ffmpeg, path)
+        entry.update(_envelope(samples))
+        entry["tempo"] = {"bpm": None, "beats": None, "status": "unknown",
+                          "reason": "テンポと拍を測る仕組みはまだ無い（依存を増やさないため）"}
+        results.append(entry)
+    if progress:
+        progress("music", len(tracks), len(tracks))
+    return {
+        "folder": str(root), "count": len(results), "tracks": results,
+        "method": {"decode": f"FFmpeg で mono {ANALYSIS_RATE} Hz にまとめて 1 秒ごとの RMS を計算",
+                   "loudness": "FFmpeg ebur128（EBU R128）", "silence_threshold_dbfs": SILENCE_DB,
+                   "quiet_below_track_rms_db": QUIET_BELOW_DB, "ffprobe": bool(ffprobe)},
+        "unknown": ["tempo_bpm", "beats", "mood"],
+        "notes": ["値は技術的な測定。明るい・穏やか・懐かしいなどの雰囲気は測っていない（推定するなら推定として扱う）",
+                  "曲は必ず先頭から使われ、短い曲は区間の長さまで繰り返される（画面の BGM と同じ）"],
     }
 
 

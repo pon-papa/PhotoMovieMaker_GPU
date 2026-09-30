@@ -11,6 +11,9 @@ ToolDock の MCP Sidecar は、このコマンドを通して PhotoMovieMaker �
     py -3 pmm_cli.py validate --project 計画.photomovie.json
     py -3 pmm_cli.py render --project 計画.photomovie.json --folder "C:\\写真\\旅行" --output 旅行.mp4 [--overwrite]
 
+    py -3 pmm_cli.py music-scan --folder "C:\\曲"
+    py -3 pmm_cli.py music-analyze --folder "C:\\曲"
+
 終了コード: 0=成功 / 1=処理できなかった / 2=使い方の誤り / 130=中止
 元の写真は読むだけで、書き換えません。
 
@@ -63,6 +66,10 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--folder", required=True)
     r.add_argument("--output", required=True)
     r.add_argument("--overwrite", action="store_true")
+    ms = sub.add_parser("music-scan", help="曲のフォルダー直下の曲を一覧にする")
+    ms.add_argument("--folder", required=True)
+    ma = sub.add_parser("music-analyze", help="曲を技術的に測る（長さ・音量の推移・無音など）")
+    ma.add_argument("--folder", required=True)
     return p
 
 
@@ -115,6 +122,10 @@ def run(argv: list[str]) -> int:
                 result = {"project": result, "saved_to": saved}
             else:
                 result = {"project": result, "saved_to": None}
+        elif args.command == "music-scan":
+            result = core.scan_music(args.folder)
+        elif args.command == "music-analyze":
+            result = core.analyze_music(args.folder, progress=progress, should_stop=should_stop)
         elif args.command == "render":
             result = core.render_project(args.project, args.folder, args.output,
                                          overwrite=args.overwrite, progress=progress,

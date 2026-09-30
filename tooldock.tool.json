@@ -22,7 +22,9 @@
     "candidate_group",
     "subject_detection",
     "project_plan",
-    "render_final"
+    "render_final",
+    "music_scan",
+    "music_analysis"
   ],
   "actions": [
     {
@@ -153,6 +155,43 @@
       "output_schema": {"type": "object", "required": ["output", "bytes", "photos", "frames", "duration_seconds", "encoder_used"],
                         "properties": {"output": {"type": "string"}, "frames": {"type": "integer"}}},
       "timeout_seconds": 3600,
+      "cancellable": true,
+      "progress": true
+    },
+    {
+      "name": "scan_music",
+      "title": "曲の一覧",
+      "description": "曲のフォルダー（許可された media root の中）の直下にある曲（mp3 / wav / m4a / aac / flac / ogg）を一覧にします。中身は読みません。",
+      "command": "music-scan",
+      "access": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "music_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder",
+                           "description": "BGM の候補を入れたフォルダー（絶対パス）"}
+        },
+        "required": ["music_folder"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["count", "tracks"]},
+      "timeout_seconds": 60
+    },
+    {
+      "name": "analyze_music",
+      "title": "曲を技術的に測る",
+      "description": "曲のフォルダー直下の曲（30 曲まで）について、長さ・形式・サンプルレート・チャンネル・メタデータ（書かれていれば）・統合ラウドネス（EBU R128）・トゥルーピーク・1 秒ごとの音量の推移・無音・静かな区間・10 区分の音量の概形を返します。テンポ・拍・雰囲気は測りません（unknown）。曲は読むだけです。",
+      "command": "music-analyze",
+      "access": "read",
+      "input_schema": {
+        "type": "object",
+        "properties": {
+          "music_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder"}
+        },
+        "required": ["music_folder"],
+        "additionalProperties": false
+      },
+      "output_schema": {"type": "object", "required": ["count", "tracks", "unknown"]},
+      "timeout_seconds": 900,
       "cancellable": true,
       "progress": true
     }
