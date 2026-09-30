@@ -158,7 +158,8 @@ class RenderProjectTest(RenderBase):
             (lambda d: [m.update(enabled=False) for m in d["media"]], "no_media"),
             (lambda d: d["media"][0].update(file="無い写真.jpg"), "missing_media"),
             (lambda d: d["media"][0].update(type="video"), "unsupported_media"),
-            (lambda d: d["bgm_segments"].append({"audio": "C:/x.mp3"}), "bgm_not_supported"),
+            # 曲の場所がパス・写真番号なし → 区間の形の検査で断る（曲のフォルダーの外は読まない）
+            (lambda d: d["bgm_segments"].append({"audio": "C:/x.mp3"}), "invalid_project"),
             (lambda d: d["video"].update(transition_seconds=2.0), "invalid_project"),
             (lambda d: d["title_card"].update(bg_color="あか"), "invalid_project"),
             (lambda d: d["title_card"].update(duration="5"), "invalid_project"),
