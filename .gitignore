@@ -22,3 +22,6 @@ models/*.onnx
 
 # 書き出し時に保存される設定ファイル（テスト生成物）
 *_settings.json
+
+# 配布物の組み立て先（GitHub Releases へ載せる。Git には入れない）
+dist/

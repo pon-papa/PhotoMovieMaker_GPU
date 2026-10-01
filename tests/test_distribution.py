@@ -187,5 +187,49 @@ class VersionAndDocsTest(unittest.TestCase):
         self.assertIn(f"({lo[0]},{lo[1]}) <= sys.version_info[:2] <= ({hi[0]},{hi[1]})", setup)
         self.assertIn("for %%V in (3.13 3.12 3.11)", setup)
 
+
+class ReleaseBuilderTest(unittest.TestCase):
+    """配布 ZIP の組み立て（tools/build_release.py）の決まり。ZIP そのものはここでは作らない。"""
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, str(ROOT / "tools"))
+        import build_release
+        cls.builder = build_release
+
+    def test_every_tracked_file_is_shipped_or_excluded(self):
+        plan = self.builder.plan()
+        self.assertEqual(plan["unclassified"], [])
+        self.assertEqual(plan["ship_but_not_tracked"], [])
+        for name in ("setup.bat", "run.bat", "diagnose.bat", "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md",
+                     "app_doctor.py", "pmm_version.py", "licenses/YuNet-MIT.txt", "licenses/YOLOX-Apache-2.0.txt",
+                     "licenses/DINOv2-Apache-2.0.txt"):
+            self.assertIn(name, plan["ship"])
+        for name in plan["excluded"]:
+            self.assertFalse(name in plan["ship"])
+        self.assertIn("tooldock.tool.json", plan["excluded"])          # 通常の利用に要らない開発用の宣言
+        self.assertTrue(all(not f.startswith(("tests/", "docs/", "tools/")) for f in plan["ship"]))
+
+    def test_scan_finds_what_must_not_ship(self):
+        with tempfile.TemporaryDirectory(prefix="pmm staging 試験 — ") as tmp:
+            folder = Path(tmp) / "PhotoMovieMaker_GPU_vX"
+            folder.mkdir()
+            (folder / "README.md").write_text("問題のない文書です。\n", encoding="utf-8")
+            (folder / "run.bat").write_bytes(b"@echo off\r\necho ok\r\n")
+            self.assertEqual(self.builder.scan(Path(tmp)), [])
+            (folder / "家族.jpg").write_bytes(b"x")
+            (folder / "作品.photomovie.json").write_text("{}", encoding="utf-8")
+            (folder / "note.md").write_text(r"置き場所は C:\Users\someone\Desktop\写真 です", encoding="utf-8")
+            (folder / "bad.bat").write_bytes(b"@echo off\necho lf only\n")
+            (folder / "__pycache__").mkdir()
+            problems = "\n".join(self.builder.scan(Path(tmp)))
+            for expected in ("家族.jpg", "作品.photomovie.json", "note.md", "bad.bat", "__pycache__"):
+                self.assertIn(expected, problems)
+
+    def test_models_in_the_build_match_the_doctor(self):
+        import app_doctor
+        self.assertEqual([m["file"] for m in app_doctor.EXPECTED_MODELS], self.builder.plan()["models"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
