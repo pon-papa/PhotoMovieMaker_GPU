@@ -180,9 +180,17 @@ def get_capabilities() -> dict:
             "project_compose",
             "timeline_preview",
             "director_record",
+            # SI Director v2
+            "safe_framing",
+            "weighted_transitions",
+            "audio_safety",
+            "section_loudness_preview",
+            "music_paging",
         ],
-        "planned": ["render_preview", "transition_primitives",
-                    "video_clips", "beat_aligned_plan"],
+        "planned": ["render_preview", "video_clips", "beat_aligned_plan", "track_start_offset"],
+        "camera_modes": sorted(CAMERA_MODES),
+        "transition_types": list(app.TRANSITION_TYPES),
+        "audio_safety_modes": list(app.AUDIO_SAFETY_MODES),
         # render は Project JSON の title_card・camera_mode（被写体追従）・BGM 区間を使う。
         # 曲は呼び出し側が明示した曲のフォルダー（music_folder）の直下だけ。
         "gui_only": [],
@@ -324,6 +332,8 @@ def analyze_photos(folder, *, use_embedding: bool = True, detect_subjects: bool 
             "candidate_group": "どれか1枚を選べば、残りは外してもよいほど互いに代わりになる写真の群",
             "variant_family": "同じ1枚の写真の別バージョン（カラー版と白黒版、コピーなど）",
             "stars": "同じ群の中での推奨度。写真の価値や良し悪しではない",
+            "face_count": "見つかった顔の数（参考値）。小さい顔・横顔・後ろ姿などは見落とすことがある。誰かは調べない",
+            "dog_count": "見つかった犬の数（参考値）。写っていても 0 になることがある。個体や犬種は調べない",
         },
     }
 
@@ -385,6 +395,36 @@ def scan_music(folder) -> dict:
             "listing_fingerprint": listing_fingerprint(tracks), "page_size_max": MAX_TRACKS}
 
 
+_JAPANESE = re.compile(r"[\u3040-\u30ff\u3400-\u9fff]")      # \u3072\u3089\u304c\u306a\u30fb\u30ab\u30bf\u30ab\u30ca\u30fb\u6f22\u5b57\uff08\u5168\u89d2\uff09
+
+
+def repair_tag_text(value: str) -> str | None:
+    """Shift_JIS（cp932）のバイト列を Latin-1 として読んで文字化けしたタグを元に戻す。戻せなければ None。
+
+    ID3 の文字コードが Latin-1 と書かれているのに中身が Shift_JIS の曲でよく起きる。
+    1 文字も U+00FF を超えない・C1 制御文字（U+0080〜U+009F: 普通の Latin-1 の文には出てこないが、
+    Shift_JIS の 1 バイト目を Latin-1 で読むと出る）がある・cp932 として読める・読んだ結果に全角の日本語がある、
+    のすべてを満たすときだけ直す（アクセント付きの欧文名などは直さない）。"""
+    if not value or any(ord(c) > 0xFF for c in value) or not any(0x80 <= ord(c) <= 0x9F for c in value):
+        return None
+    try:
+        fixed = value.encode("latin-1").decode("cp932")
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+    return fixed if _JAPANESE.search(fixed) else None
+
+
+def _readable_tags(tags: dict) -> dict:
+    """タグを読める形で返す。直したときは tags_repaired に直した項目名を入れる（元の値は tags_raw）。"""
+    repaired = {k: repair_tag_text(v) for k, v in tags.items()}
+    changed = sorted(k for k, v in repaired.items() if v is not None)
+    if not changed:
+        return {"tags": tags}
+    return {"tags": {k: (repaired[k] if repaired[k] is not None else v) for k, v in tags.items()},
+            "tags_repaired": changed, "tags_raw": {k: tags[k] for k in changed},
+            "tags_note": "Shift_JIS を Latin-1 として読んだ文字化けを直した（推定による修復）"}
+
+
 def _probe_track(ffprobe: str | None, path: Path) -> dict:
     if not ffprobe:
         return {}
@@ -412,7 +452,7 @@ def _probe_track(ffprobe: str | None, path: Path) -> dict:
         "channel_layout": stream.get("channel_layout"),
         "bit_rate": number(fmt.get("bit_rate"), int),
         "probe_duration_seconds": number(fmt.get("duration")),
-        "tags": {k: str(tags[k])[:200] for k in ("title", "artist", "album", "genre", "date") if k in tags},
+        **_readable_tags({k: str(tags[k])[:200] for k in ("title", "artist", "album", "genre", "date") if k in tags}),
     }
 
 

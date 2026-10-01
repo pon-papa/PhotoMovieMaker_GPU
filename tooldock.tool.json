@@ -27,7 +27,7 @@
     "music_analysis",
     "project_compose",
     "timeline_preview",
-    "director_record"
+    "director_record", "safe_framing", "weighted_transitions", "audio_safety", "section_loudness_preview", "music_paging"
   ],
   "actions": [
     {
@@ -62,7 +62,7 @@
     {
       "name": "analyze_photos",
       "title": "おすすめ解析",
-      "description": "写真を解析し、代替候補グループ（どれか1枚を選べば残りは外してよい写真の群）・同じ写真の別バージョン（カラー版と白黒版など）・群の中での推奨度（星）・人物/犬の数・撮影時刻を返します。星は写真の価値ではなく群の中での順位です。写真を外したり並べ替えたりはしません。数百枚で数分かかります。",
+      "description": "写真を解析し、代替候補グループ（どれか1枚を選べば残りは外してよい写真の群）・同じ写真の別バージョン（カラー版と白黒版など）・群の中での推奨度（星）・人物/犬の数・撮影時刻を返します。星は写真の価値ではなく群の中での順位です。写真を外したり並べ替えたりはしません。数百枚で数分かかります。顔・犬の検出数（face_count / dog_count）は参考値で、写っていても見落とすことがあります。",
       "command": "analyze",
       "access": "read",
       "input_schema": {

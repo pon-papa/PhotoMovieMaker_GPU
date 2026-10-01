@@ -470,7 +470,7 @@ py -3 pmm_cli.py render --project "C:\計画\広島.photomovie.json" --folder "C
 
 AI（SI）が写真と BGM の候補を見比べて、選択・順序・選曲・曲の区間・タイトルを決め、
 PhotoMovieMaker がそのとおりに書き出すための部品があります（`music-scan`・`music-analyze`・`compose`・`preview`・`director`）。
-判断は SI 側で、PhotoMovieMaker の中に AI は入っていません。仕組みと約束ごとは [docs/SI_DIRECTOR_V1.md](docs/SI_DIRECTOR_V1.md) にあります。
+判断は SI 側で、PhotoMovieMaker の中に AI は入っていません。仕組みと約束ごとは [docs/SI_DIRECTOR_V1.md](docs/SI_DIRECTOR_V1.md) にあります。実作品を見て直したところ（安全な構図・つなぎ方・音声の安全・曲のページ送り）は [docs/SI_DIRECTOR_V2.md](docs/SI_DIRECTOR_V2.md)。
 
 ### Project JSON（上映計画）
 
