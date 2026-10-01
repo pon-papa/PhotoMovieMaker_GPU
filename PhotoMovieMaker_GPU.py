@@ -259,6 +259,8 @@ class BGMSegment:
     start_index: int  # 0-based
     end_index: int    # 0-based, inclusive
     audio_path: Path
+    # この区間の曲だけの音量（dB）。0 なら何もしない（従来と同じコマンド）。SI Director v2
+    gain_db: float = 0.0
 
 
 @dataclass
@@ -1178,6 +1180,8 @@ class VideoRenderer:
                 f"atrim=duration={duration:.6f},"
                 f"asetpts=PTS-STARTPTS,"
             )
+            if _seg.gain_db:
+                chain += f"volume={_seg.gain_db:.2f}dB,"
 
             if fade_in > 0:
                 chain += f"afade=t=in:st=0:d={fade_in:.6f},"
@@ -1354,6 +1358,7 @@ class VideoRenderer:
                     "start_file": names[s_.start_index] if s_.start_index < len(names) else "",
                     "end_file": names[s_.end_index] if s_.end_index < len(names) else "",
                     "audio": str(s_.audio_path),
+                    **({"gain_db": s_.gain_db} if s_.gain_db else {}),
                 }
                 for s_ in sorted(self.bgm_segments, key=lambda x: x.start_index)
             ],

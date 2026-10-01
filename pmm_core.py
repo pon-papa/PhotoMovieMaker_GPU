@@ -72,7 +72,9 @@ MEDIA_TYPES = {"image", "video"}        # video は将来用（今はまだ描�
 # 曲の形式は、画面の曲選択（AUDIO_FILETYPES の絞り込み）と同じものだけ
 AUDIO_SUFFIXES = frozenset(pattern[1:].lower() for pattern in app.AUDIO_FILETYPES[0][1].split())
 # Project JSON の BGM 区間の項目。*_settings.json の bgm_segments と同じ名前（audio はファイル名だけ）
-SEGMENT_KEYS = {"start_photo", "end_photo", "audio", "start_file", "end_file"}
+SEGMENT_KEYS = {"start_photo", "end_photo", "audio", "start_file", "end_file", "gain_db"}
+SEGMENT_GAIN_RANGE = (-24.0, 12.0)      # 区間ごとの音量（dB）。SI Director v2
+SECTION_STEP_WARNING_DB = 3.0           # 曲の境目でこれ以上音量が変わると予想されたら知らせる
 
 
 class CoreError(Exception):
@@ -648,6 +650,8 @@ def _validate_segments(project: dict, problems: list[str]) -> None:
         if last > len(shown):
             problems.append(f"{where}: 使う写真は {len(shown)} 枚です（end_photo {last}）。")
             continue
+        if "gain_db" in s and not _number(s["gain_db"], *SEGMENT_GAIN_RANGE):
+            problems.append(f"{where}.gain_db は {SEGMENT_GAIN_RANGE[0]:g}〜{SEGMENT_GAIN_RANGE[1]:g} の数（dB）です。")
         for key, position in (("start_file", first), ("end_file", last)):
             if key in s and s[key] != shown[position - 1]:
                 problems.append(f"{where}.{key} が {position} 枚目の写真（{shown[position - 1]}）と違います。")
@@ -966,7 +970,8 @@ def resolve_bgm(project: dict, music_folder) -> tuple[Path | None, list]:
             raise CoreError("missing_audio", f"曲が見つかりません: {s['audio']}")
         if os.path.normcase(os.path.dirname(os.path.realpath(path))) != real_root:
             raise CoreError("invalid_audio", f"{s['audio']}: 曲のフォルダーの外を指すリンクは使えません。")
-        result.append(app.BGMSegment(s["start_photo"] - 1, s["end_photo"] - 1, path))
+        result.append(app.BGMSegment(s["start_photo"] - 1, s["end_photo"] - 1, path,
+                                     gain_db=float(s.get("gain_db") or 0.0)))
     return root, result
 
 
@@ -1207,6 +1212,33 @@ def _clock(seconds: float) -> str:
     return f"{whole // 60:02d}:{whole % 60:02d}"
 
 
+def _section_level(path: Path, duration: float, fade_in: float, fade_out: float, gain_db: float,
+                   decoded: dict) -> dict:
+    """曲のうち実際に使う秒（先頭から duration 秒。短い曲は繰り返し）の音量の見込み。
+
+    曲全体の値ではなく、使う範囲の 1 秒ごとの RMS（analyze_music と同じ測り方）から出す。
+    フェードの秒は除く。gain_db（区間の音量・headroom）は足す。リミッターの効き目は含まない。"""
+    key = str(path)
+    if key not in decoded:
+        try:
+            decoded[key] = _envelope(_decode_mono(app.find_ffmpeg(), path))["per_second_rms_dbfs"]
+        except CoreError:
+            decoded[key] = []
+    per_second = decoded[key]
+    if not per_second:
+        return {"median_rms_dbfs": None, "note": "曲を読めませんでした"}
+    count = max(1, int(math.floor(duration)))
+    used = [per_second[i % len(per_second)] for i in range(count)]
+    inner = used[int(math.ceil(fade_in)):max(int(math.ceil(fade_in)), int(math.floor(duration - fade_out)))] or used
+    ordered = sorted(inner)
+    mid = len(ordered) // 2
+    median = ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2.0
+    mean = 10 * math.log10(sum(10 ** (d / 10.0) for d in inner) / len(inner))
+    return {"median_rms_dbfs": round(median + gain_db, 1), "mean_rms_dbfs": round(mean + gain_db, 1),
+            "seconds_measured": len(inner), "gain_db_applied": round(gain_db, 2),
+            "method": "使う範囲の 1 秒ごとの RMS（mono 8 kHz）。フェードの秒を除く。リミッター前"}
+
+
 def build_timeline(project: dict, plan: dict) -> dict:
     """書き出したときの時間割（タイトル・写真・曲）を、同じ VideoRenderer の計算で求める。
 
@@ -1227,6 +1259,9 @@ def build_timeline(project: dict, plan: dict) -> dict:
     ffprobe = find_ffprobe()
     lengths: dict = {}
     music, warnings = [], []
+    decoded: dict = {}
+    safety = app.normalize_audio_safety(project.get("audio_safety"))
+    headroom = -safety["headroom_db"] if safety and safety["mode"] == app.AUDIO_HEADROOM else 0.0
     planned = renderer.bgm_plan(renderer.validate_bgm_segments()) if plan["segments"] else []
     for seg in plan["segments"]:
         name = seg.audio_path.name
@@ -1249,7 +1284,23 @@ def build_timeline(project: dict, plan: dict) -> dict:
             elif lengths[name] is not None:
                 item["repeats"] = False
                 item["uses_first_seconds_of_track"] = round(duration, 3)
+            if seg.gain_db:
+                item["gain_db"] = seg.gain_db
+            item["expected_level"] = _section_level(seg.audio_path, duration, fade_in, fade_out,
+                                                    seg.gain_db + headroom, decoded)
         music.append(item)
+    previous = None
+    for item in music:
+        level = item.get("expected_level") or {}
+        if level.get("median_rms_dbfs") is None:
+            continue
+        if previous is not None:
+            step = round(level["median_rms_dbfs"] - previous["expected_level"]["median_rms_dbfs"], 1)
+            item["step_from_previous_db"] = step
+            if abs(step) > SECTION_STEP_WARNING_DB:
+                warnings.append(f"{previous['audio']} → {item['audio']}: 使う区間の音量が {step:+.1f} dB 変わる見込みです"
+                                "（曲全体ではなく、実際に使う秒の測定から）。")
+        previous = item
     silent, cursor = [], 0.0
     for item in sorted((m for m in music if m["sounds"]), key=lambda m: m["starts_at"]):
         if item["starts_at"] - cursor > 0.05:
