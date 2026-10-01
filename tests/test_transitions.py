@@ -217,6 +217,89 @@ class RendererTransitionTest(unittest.TestCase):
                 self.render(bad, "x.mp4")
 
 
+class ComposePreviewTest(unittest.TestCase):
+    """compose で一度だけ確定し、preview で境目ごとに確かめられ、同じ Project は同じ映像になる。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="pmm compose transition 試験 — ")
+        self.addCleanup(self._tmp.cleanup)
+        base = Path(self._tmp.name)
+        self.photos, self.out = base / "写真 & 素材 #1", base / "出力 #2"
+        self.photos.mkdir()
+        self.out.mkdir()
+        for k in range(6):
+            Image.new("RGB", (160, 90), (40 * k, 200 - 30 * k, 90)).save(self.photos / f"写真 {k + 1}.png")
+        self.selected = [f"写真 {k}.png" for k in (2, 1, 3, 6, 5, 4)]
+
+    def edits(self, **transitions):
+        edits = {"selected": self.selected, "title_card": {"main": "つなぎ方", "duration": 2.0, "text_fade_seconds": 1.0},
+                 "video": {"width": 160, "height": 90, "fps": 10, "interval_seconds": 1.0,
+                           "transition_seconds": 0.4, "zoom_percent": 0.0, "encoder_choice": "cpu"}}
+        if transitions:
+            edits["transitions"] = transitions
+        return edits
+
+    def compose(self, name, **transitions):
+        return core.compose_project(self.photos, self.edits(**transitions), self.out / f"{name}.photomovie.json")
+
+    def test_compose_fixes_the_sequence_and_preview_shows_it(self):
+        result = self.compose("作品", profile=DYNAMIC, seed=42, overrides=[{"after_photo": 3, "type": "fade_black"}])
+        block = result["project"]["transitions"]
+        self.assertEqual((block["seed"], len(block["sequence"]), block["sequence"][2]), (42, 5, "fade_black"))
+        preview = core.preview_project(result["project_file"], self.photos)["timeline"]
+        self.assertEqual([b["type"] for b in preview["transitions"]], block["sequence"])
+        third = preview["transitions"][2]
+        self.assertEqual((third["after_photo"], third["from_file"], third["to_file"], third["seconds"]),
+                         (3, "写真 3.png", "写真 6.png", 0.4))
+        self.assertEqual(third["starts_at"], 4.6)                    # タイトル 2 秒 + 3 枚 - 0.4 秒
+        for b in preview["transitions"]:
+            self.assertEqual(b["seconds"], 0.0 if b["type"] == "cut" else 0.4)
+        self.assertIn("00:05 ↪ fade_black（写真 3→4）", preview["lines"])
+        self.assertEqual(sum(preview["transition_counts"].values()), 5)
+        self.assertEqual(preview["title_transition"], {"type": "crossfade", "seconds": 1.0})
+
+    def test_same_inputs_same_project_and_default_seed_is_stored(self):
+        a = self.compose("一", profile=CALM)["project"]["transitions"]
+        b = self.compose("二", profile=CALM)["project"]["transitions"]
+        self.assertEqual(a, b)
+        self.assertIsInstance(a["seed"], int)
+        self.assertEqual(a["method"], core.TRANSITION_METHOD)
+
+    def test_old_style_compose_is_crossfade_only(self):
+        result = self.compose("従来")
+        self.assertNotIn("transitions", result["project"])
+        timeline = core.preview_project(result["project_file"], self.photos)["timeline"]
+        self.assertEqual({b["type"] for b in timeline["transitions"]}, {"crossfade"})
+        self.assertFalse(any("↪" in line for line in timeline["lines"]))
+
+    def test_bad_transition_edits(self):
+        cases = [({"profile": {"crossfade": 0.5}}, "invalid_transitions"),
+                 ({"profile": {"spin": 1.0}}, "invalid_transitions"),
+                 ({"overrides": [{"after_photo": 6, "type": "cut"}]}, "invalid_transitions"),
+                 ({"seed": -3}, "invalid_transitions")]
+        for change, code in cases:
+            with self.subTest(change=change), self.assertRaises(core.CoreError) as ctx:
+                self.compose("x", **change)
+            self.assertEqual(ctx.exception.code, code)
+        edits = self.edits()
+        edits["transitions"] = {"profile": CALM, "sequence": ["cut"] * 5}
+        with self.assertRaises(core.CoreError) as ctx:
+            core.compose_project(self.photos, edits, self.out / "y.photomovie.json")
+        self.assertEqual(ctx.exception.code, "invalid_edits")
+        self.assertEqual(sorted(p.name for p in self.out.iterdir()), [])
+
+    def test_same_project_renders_the_same_video(self):
+        result = self.compose("同じ", profile=DYNAMIC, seed=7)
+        hashes = []
+        for k in (1, 2):
+            r = core.render_project(result["project_file"], self.photos, self.out / f"同じ {k}.mp4")
+            self.assertEqual(r["transitions"], {t: n for t, n in
+                                                ((t, result["project"]["transitions"]["sequence"].count(t))
+                                                 for t in core.TRANSITION_TYPES) if n})
+            hashes.append(hashlib.sha256(Path(r["output"]).read_bytes()).hexdigest())
+        self.assertEqual(hashes[0], hashes[1])
+
+
 PINNED_CALM_12_SEED_1 = ["cut"] + ["crossfade"] * 8 + ["fade_black", "crossfade"]   # 実装時に計算して固定
 
 

@@ -203,7 +203,7 @@
     {
       "name": "compose_project",
       "title": "決めたとおりに Project を組み立てる",
-      "description": "写真フォルダーから新しい Project JSON を組み立てて save_to に保存し、時間割（timeline）を返します。edits_json は JSON オブジェクトの文字列で、selected（使う写真のファイル名を上映順に）・title_card（main / sub / date など）・video（interval_seconds / transition_seconds / camera_mode など）・bgm_timing・bgm_segments（{start_photo, end_photo, audio}: 使う写真の何枚目から何枚目までに、music_folder 直下のどの曲を流すか）・target_duration_seconds・director（Director Plan: 判断の記録。あれば <名前>.director.json として隣に置く）を書けます。ここでは写真を選んだり並べ替えたりしません（決めるのは呼び出し側）。既存の Project は overwrite を指定しない限り上書きしません。写真と曲は読むだけです。",
+      "description": "写真フォルダーから新しい Project JSON を組み立てて save_to に保存し、時間割（timeline）を返します。edits_json は JSON オブジェクトの文字列で、selected（使う写真のファイル名を上映順に）・title_card（main / sub / date など）・video（interval_seconds / transition_seconds / camera_mode など。camera_mode は legacy / subject / subject_safe＝被写体の枠を画面に残すよう写真ごとにパンを抑え・ズームを弱める）・bgm_timing・bgm_segments（{start_photo, end_photo, audio}: 使う写真の何枚目から何枚目までに、music_folder 直下のどの曲を流すか）・target_duration_seconds・director（Director Plan: 判断の記録。あれば <名前>.director.json として隣に置く）・transitions（つなぎ方の方針 {profile: {crossfade / cut / fade_black / slide: 確率（合計 1.0）}, seed, overrides: [{after_photo, type}]}。ここで写真の境目ごとの種類を一度だけ確定して Project に保存し、書き出しでは選び直さない）を書けます。ここでは写真を選んだり並べ替えたりしません（決めるのは呼び出し側）。既存の Project は overwrite を指定しない限り上書きしません。写真と曲は読むだけです。",
       "command": "compose",
       "access": "write",
       "input_schema": {
@@ -229,7 +229,7 @@
     {
       "name": "preview_project",
       "title": "書き出す前の確認と時間割",
-      "description": "保存した Project JSON を、書き出すときと同じ規則で確かめ（写真・曲の有無、曲のフォルダーの境界、区間の範囲など）、時間割を返します。時間割には、タイトル・各写真の表示時刻・各曲の鳴り始め・長さ・フェード・曲が区間より短くて繰り返されるかどうか・無音の範囲・目標の長さとのずれ・読みやすい行（00:03 ♪ …）が入ります。何も書きません。",
+      "description": "保存した Project JSON を、書き出すときと同じ規則で確かめ（写真・曲の有無、曲のフォルダーの境界、区間の範囲など）、時間割を返します。時間割には、タイトル・各写真の表示時刻・各曲の鳴り始め・長さ・フェード・曲が区間より短くて繰り返されるかどうか・無音の範囲・目標の長さとのずれ・写真の境目ごとのつなぎ方と長さ（transitions）・読みやすい行（00:03 ♪ …）が入ります。何も書きません。",
       "command": "preview",
       "access": "read",
       "input_schema": {

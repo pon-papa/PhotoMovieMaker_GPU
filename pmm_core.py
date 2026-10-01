@@ -1188,7 +1188,8 @@ DIRECTOR_KIND = "photomoviemaker.director_plan"
 DIRECTOR_VERSION = 1
 DIRECTOR_RESERVED = {"kind", "project_file", "saved_at", "computed"}
 MAX_DIRECTOR_BYTES = 64 * 1024
-EDIT_KEYS = {"selected", "title_card", "video", "bgm_timing", "bgm_segments", "target_duration_seconds", "director"}
+EDIT_KEYS = {"selected", "title_card", "video", "bgm_timing", "bgm_segments", "target_duration_seconds", "director",
+             "transitions"}
 VIDEO_KEYS = set(DEFAULT_VIDEO)
 _ABSOLUTE_PATH = re.compile(r"(?i)(?:^|[\s\"'(])(?:[a-z]:[\\/]|\\\\[^\\\s])")
 
@@ -1258,13 +1259,29 @@ def build_timeline(project: dict, plan: dict) -> dict:
     events = [(p["start_seconds"], f"写真 {p['position']} {p['file']}") for p in photos]
     events += [(m["starts_at"], f"♪ {m['audio']}（写真 {m['start_photo']}〜{m['end_photo']}"
                 + ("・繰り返し" if m.get("repeats") else "") + "）") for m in music if m["sounds"]]
+    # 写真の境目ごとのつなぎ方（transitions が無い Project はすべてクロスフェード）
+    window = renderer.transition_frames / renderer.fps
+    boundaries = []
+    for i, kind in enumerate(transition_sequence(project), 1):
+        seconds = 0.0 if kind == app.TRANSITION_CUT else round(window, 3)
+        boundaries.append({"after_photo": i, "from_file": photos[i - 1]["file"], "to_file": photos[i]["file"],
+                           "type": kind, "seconds": seconds,
+                           "starts_at": round(photos[i - 1]["end_seconds"] - seconds, 3)})
+    # 時間割の行には、目立つつなぎ方だけを書く（クロスフェードは書かない＝v1 と同じ行）
+    events += [(b["starts_at"], f"↪ {b['type']}（写真 {b['after_photo']}→{b['after_photo'] + 1}）")
+               for b in boundaries if b["type"] != app.TRANSITION_CROSSFADE]
     lines += [f"{_clock(t)} {text}" for t, text in sorted(events, key=lambda e: e[0])]
     lines.append(f"{_clock(total)} 終わり")
+    counts = {t: sum(1 for b in boundaries if b["type"] == t) for t in TRANSITION_TYPES}
     return {"total_seconds": round(total, 3), "target_duration_seconds": target,
             "title_seconds": round(title_seconds, 3), "seconds_per_photo": round(span, 3),
             "crossfade_seconds": round(renderer.transition, 3), "photo_count": len(photos),
             "title": ({"main": title.main, "sub": title.sub, "date": title.date} if renderer.title else None),
+            "title_transition": ({"type": app.TRANSITION_CROSSFADE,
+                                  "seconds": round(renderer.title_fade_frames / renderer.fps, 3)}
+                                 if renderer.title else None),
             "photos": photos, "music": music, "silent_ranges": silent if plan["segments"] else [],
+            "transitions": boundaries, "transition_counts": {t: n for t, n in counts.items() if n},
             "warnings": warnings, "lines": lines}
 
 
@@ -1346,6 +1363,23 @@ def save_director_plan(project_file, plan: dict, *, overwrite: bool = False) -> 
     return {"director_file": str(target), "computed": record["computed"]}
 
 
+def _compose_transitions(change, selected: list[str]) -> dict:
+    """edits.transitions（profile / seed / overrides）から、境目ごとのつなぎ方を一度だけ確定する。"""
+    if not isinstance(change, dict) or set(change) - {"profile", "seed", "overrides"}:
+        raise CoreError("invalid_edits", "transitions に使える項目は profile / seed / overrides です。")
+    profile = change.get("profile") or {app.TRANSITION_CROSSFADE: 1.0}
+    problems = _transition_problems({"profile": profile, "overrides": change.get("overrides") or []}, len(selected))
+    if problems:
+        raise CoreError("invalid_transitions", " / ".join(problems))
+    seed = change.get("seed")
+    if seed is None:
+        seed = default_transition_seed(selected, profile)
+    overrides = sorted(change.get("overrides") or [], key=lambda o: o["after_photo"])
+    sequence = plan_transitions(len(selected), profile, seed, overrides)
+    return {"profile": profile, "seed": seed, "overrides": overrides, "sequence": sequence,
+            "method": TRANSITION_METHOD}
+
+
 def compose_project(folder, edits: dict, save_to, *, music_folder=None, overwrite: bool = False) -> dict:
     """写真フォルダーから、SI の決めたとおりの Project JSON を新しく組み立てて保存する。
 
@@ -1355,6 +1389,8 @@ def compose_project(folder, edits: dict, save_to, *, music_folder=None, overwrit
       bgm_segments            使う写真の何枚目から何枚目までにどの曲（music_folder 直下のファイル名）
       target_duration_seconds 目標の長さ
       director                Director Plan（あれば <名前>.director.json として隣に置く）
+      transitions             つなぎ方の方針 {profile: {種類: 確率}, seed, overrides: [{after_photo, type}]}。
+                              ここで境目ごとの種類を一度だけ確定して Project に保存する（書き出しでは選び直さない）
     既存の Project は上書きしない（overwrite を指定したときだけ）。写真・曲は読むだけ。"""
     if not isinstance(edits, dict) or set(edits) - EDIT_KEYS:
         raise CoreError("invalid_edits", f"edits に使える項目は {sorted(EDIT_KEYS)} です。")
@@ -1388,6 +1424,8 @@ def compose_project(folder, edits: dict, save_to, *, music_folder=None, overwrit
     project["project"]["title"] = project["title_card"]["main"]
     if "target_duration_seconds" in edits:
         project["project"]["target_duration_seconds"] = edits["target_duration_seconds"]
+    if "transitions" in edits:
+        project["transitions"] = _compose_transitions(edits["transitions"], selected)
     segments = edits.get("bgm_segments") or []
     project["bgm_segments"] = segments
     if segments:
