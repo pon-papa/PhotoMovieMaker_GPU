@@ -867,6 +867,11 @@ def validate_project(project) -> list[str]:
         if not isinstance(block, dict) or set(block) - known:
             problems.append(f"{key} の項目が不正です（使える項目: {sorted(known)}）。")
     _validate_segments(project, problems)
+    if "audio_safety" in project:
+        try:
+            app.normalize_audio_safety(project["audio_safety"])
+        except ValueError as e:
+            problems.append(str(e))
     if "transitions" in project:
         block = project["transitions"]
         found = _transition_problems(block, len(shown_files(project)))
@@ -1088,6 +1093,8 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
             camera_mode=video["camera_mode"],
             # transitions が無い Project（v1）は None のまま＝従来どおりクロスフェードだけ
             transitions=transition_sequence(project) if "transitions" in project else None,
+            # audio_safety が無い Project（v1）は None のまま＝従来どおりの音声
+            audio_safety=project.get("audio_safety"),
             settings_extra={
                 # 設定ファイルには、一時フォルダーではなく実際の書き出し先を残す
                 "output": str(target),
@@ -1170,6 +1177,7 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
                          if renderer.camera_mode == app.CAMERA_SUBJECT_SAFE else None),
         "transitions": ({t: renderer.transitions.count(t) for t in TRANSITION_TYPES if t in renderer.transitions}
                         if renderer.transitions is not None else None),
+        "audio_safety": renderer.audio_report,
         "title_card": bool(renderer.title),
         "bgm_tracks": [s.audio_path.name for s in plan["segments"]],
         "encoder_used": renderer.encoder_used,
@@ -1189,7 +1197,7 @@ DIRECTOR_VERSION = 1
 DIRECTOR_RESERVED = {"kind", "project_file", "saved_at", "computed"}
 MAX_DIRECTOR_BYTES = 64 * 1024
 EDIT_KEYS = {"selected", "title_card", "video", "bgm_timing", "bgm_segments", "target_duration_seconds", "director",
-             "transitions"}
+             "transitions", "audio_safety"}
 VIDEO_KEYS = set(DEFAULT_VIDEO)
 _ABSOLUTE_PATH = re.compile(r"(?i)(?:^|[\s\"'(])(?:[a-z]:[\\/]|\\\\[^\\\s])")
 
@@ -1282,6 +1290,7 @@ def build_timeline(project: dict, plan: dict) -> dict:
                                  if renderer.title else None),
             "photos": photos, "music": music, "silent_ranges": silent if plan["segments"] else [],
             "transitions": boundaries, "transition_counts": {t: n for t, n in counts.items() if n},
+            "audio_safety": app.normalize_audio_safety(project.get("audio_safety")) or {"mode": app.AUDIO_LEGACY},
             "warnings": warnings, "lines": lines}
 
 
@@ -1391,6 +1400,8 @@ def compose_project(folder, edits: dict, save_to, *, music_folder=None, overwrit
       director                Director Plan（あれば <名前>.director.json として隣に置く）
       transitions             つなぎ方の方針 {profile: {種類: 確率}, seed, overrides: [{after_photo, type}]}。
                               ここで境目ごとの種類を一度だけ確定して Project に保存する（書き出しでは選び直さない）
+      audio_safety            音声の安全 {mode: legacy / headroom / limiter, headroom_db, ceiling_db}。
+                              無ければ従来どおり（legacy）
     既存の Project は上書きしない（overwrite を指定したときだけ）。写真・曲は読むだけ。"""
     if not isinstance(edits, dict) or set(edits) - EDIT_KEYS:
         raise CoreError("invalid_edits", f"edits に使える項目は {sorted(EDIT_KEYS)} です。")
@@ -1426,6 +1437,12 @@ def compose_project(folder, edits: dict, save_to, *, music_folder=None, overwrit
         project["project"]["target_duration_seconds"] = edits["target_duration_seconds"]
     if "transitions" in edits:
         project["transitions"] = _compose_transitions(edits["transitions"], selected)
+    if "audio_safety" in edits:
+        try:
+            app.normalize_audio_safety(edits["audio_safety"])
+        except ValueError as e:
+            raise CoreError("invalid_edits", str(e)) from None
+        project["audio_safety"] = edits["audio_safety"]
     segments = edits.get("bgm_segments") or []
     project["bgm_segments"] = segments
     if segments:

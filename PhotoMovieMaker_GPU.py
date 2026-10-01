@@ -84,6 +84,39 @@ TRANSITION_CUT = "cut"
 TRANSITION_FADE_BLACK = "fade_black"
 TRANSITION_SLIDE = "slide"
 TRANSITION_TYPES = (TRANSITION_CROSSFADE, TRANSITION_CUT, TRANSITION_FADE_BLACK, TRANSITION_SLIDE)
+
+# 音声の安全（SI Director v2）。Project に指定が無ければ legacy（従来どおり何もしない）。
+AUDIO_LEGACY = "legacy"
+AUDIO_HEADROOM = "headroom"      # 全体の音量を決まった量だけ下げる
+AUDIO_LIMITER = "limiter"        # リミッター＋AAC 後のトゥルーピークを測って上限を守る
+AUDIO_SAFETY_MODES = (AUDIO_LEGACY, AUDIO_HEADROOM, AUDIO_LIMITER)
+DEFAULT_HEADROOM_DB = 1.0
+DEFAULT_CEILING_DB = -1.0
+LIMITER_OVERSAMPLE = 4
+LIMITER_MARGIN_DB = 0.5          # リミッターは上限より少し低く（AAC 化で少し上振れするため）
+LIMITER_CORRECTION_MARGIN_DB = 0.2
+LIMITER_MAX_CORRECTIONS = 2
+
+
+def normalize_audio_safety(value) -> dict | None:
+    """audio_safety の指定を確かめて形をそろえる。legacy・指定なしは None（従来どおり）。"""
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) - {"mode", "headroom_db", "ceiling_db"}
+            or value.get("mode") not in AUDIO_SAFETY_MODES):
+        raise ValueError("audio_safety は {mode: legacy / headroom / limiter, headroom_db, ceiling_db} です。")
+    mode = value["mode"]
+    if mode == AUDIO_LEGACY:
+        return None
+    if mode == AUDIO_HEADROOM:
+        db = value.get("headroom_db", DEFAULT_HEADROOM_DB)
+        if not isinstance(db, (int, float)) or isinstance(db, bool) or not 0.0 < db <= 24.0:
+            raise ValueError("audio_safety.headroom_db は 0 より大きく 24 以下（下げる dB）です。")
+        return {"mode": mode, "headroom_db": float(db)}
+    ceiling = value.get("ceiling_db", DEFAULT_CEILING_DB)
+    if not isinstance(ceiling, (int, float)) or isinstance(ceiling, bool) or not -12.0 <= ceiling <= 0.0:
+        raise ValueError("audio_safety.ceiling_db は -12〜0（トゥルーピークの上限 dBTP）です。")
+    return {"mode": mode, "ceiling_db": float(ceiling)}
 SUPPORTED_IMAGES = {".jpg", ".jpeg", ".png", ".webp", ".bmp", ".tif", ".tiff"}
 AUDIO_FILETYPES = [
     ("Audio", "*.mp3 *.wav *.m4a *.aac *.flac *.ogg"),
@@ -283,6 +316,7 @@ class VideoRenderer:
         camera_mode: str = CAMERA_LEGACY,
         settings_extra: dict | None = None,
         transitions: list[str] | None = None,
+        audio_safety: dict | None = None,
     ):
         self.images = image_paths
         self.output = output_path
@@ -310,6 +344,9 @@ class VideoRenderer:
                     or any(t not in TRANSITION_TYPES for t in transitions)):
                 raise ValueError("写真のつなぎ方の並びが写真の枚数と合いません。")
         self.transitions = transitions
+        # 音声の安全。None（legacy）なら BGM の合成コマンドは従来と同じ。
+        self.audio_safety = normalize_audio_safety(audio_safety)
+        self.audio_report: dict | None = None
         # 写真ごとの解析結果。画像は持たず、bbox由来の軽い値だけ。
         # 並べ替えても別の写真へ結果が付かないよう、キーは写真のパスにする。
         self.detections: dict[str, object] = {}
@@ -1097,6 +1134,31 @@ class VideoRenderer:
             shutil.move(str(silent_video), str(self.output))
             return
 
+        post = self.audio_post_filter(plan)
+        self.q.put(("status", "BGMを合成しています…"))
+        self.run_ffmpeg_cancellable(self.bgm_command(silent_video, plan, post), "BGM合成失敗")
+
+        if self.audio_safety and self.audio_safety["mode"] == AUDIO_LIMITER:
+            # AAC にしたあとの実際のトゥルーピークを測り、上限を超えていれば音量だけ下げて作り直す。
+            # 同じ入力なら測定値も同じなので、結果は毎回同じになる。
+            ceiling = self.audio_safety["ceiling_db"]
+            report = self.audio_report
+            report["passes"] = [{"true_peak_dbtp": self.measure_true_peak(self.output), "gain_db": 0.0}]
+            gain = 0.0
+            for _ in range(LIMITER_MAX_CORRECTIONS):
+                peak = report["passes"][-1]["true_peak_dbtp"]
+                if peak is None or peak <= ceiling:
+                    break
+                gain = round(gain + (ceiling - peak) - LIMITER_CORRECTION_MARGIN_DB, 2)
+                self.q.put(("status", f"音声のピークを下げて作り直しています（{gain:+.2f} dB）…"))
+                self.run_ffmpeg_cancellable(
+                    self.bgm_command(silent_video, plan, post + f",volume={gain:.2f}dB"), "BGM合成失敗")
+                report["passes"].append({"true_peak_dbtp": self.measure_true_peak(self.output), "gain_db": gain})
+            report["correction_gain_db"] = gain
+            report["true_peak_dbtp"] = report["passes"][-1]["true_peak_dbtp"]
+
+    def bgm_command(self, silent_video: Path, plan, post: str = "") -> list[str]:
+        """BGM を合成する FFmpeg のコマンド。post は最後の音声に足すフィルター（従来は空）。"""
         cmd = [
             self.ffmpeg, "-y",
             "-hide_banner", "-loglevel", "error",
@@ -1135,13 +1197,13 @@ class VideoRenderer:
 
         if len(labels) == 1:
             # 1曲だけでも全体長へ揃える
-            filters.append(f"{labels[0]}apad,atrim=duration={self.total_duration:.6f}[mix]")
+            filters.append(f"{labels[0]}apad,atrim=duration={self.total_duration:.6f}{post}[mix]")
         else:
             # 時間上は重ならない設計なので amix は「並べる」だけの役割。
             filters.append(
                 "".join(labels)
                 + f"amix=inputs={len(labels)}:duration=longest:normalize=0,"
-                  f"apad,atrim=duration={self.total_duration:.6f}[mix]"
+                  f"apad,atrim=duration={self.total_duration:.6f}{post}[mix]"
             )
 
         filter_complex = ";".join(filters)
@@ -1157,9 +1219,12 @@ class VideoRenderer:
             "-shortest",
             str(self.output),
         ]
+        return cmd
 
-        self.q.put(("status", "BGMを合成しています…"))
+    def run_ffmpeg_cancellable(self, cmd: list[str], failure: str) -> str:
+        """FFmpeg を動かし、終わるまで stop_event を見張る。戻り値は stderr。
 
+        止めたら FFmpeg を終わらせ、作りかけの完成ファイルは残さない。"""
         creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
         proc = subprocess.Popen(
             cmd,
@@ -1188,9 +1253,59 @@ class VideoRenderer:
                 proc.stderr.close()
             except OSError:
                 pass
+        stderr = b"".join(errors).decode("utf-8", errors="replace")
         if proc.returncode != 0:
-            stderr = b"".join(errors).decode("utf-8", errors="replace")
-            raise RuntimeError("BGM合成失敗:\n" + stderr[-5000:])
+            raise RuntimeError(f"{failure}:\n" + stderr[-5000:])
+        return stderr
+
+    # ------------------------------------------------------------------
+    # 音声の安全（SI Director v2）。指定が無ければ従来どおり何もしない（legacy）。
+    # ------------------------------------------------------------------
+
+    def audio_post_filter(self, plan) -> str:
+        """最後の音声（[mix]）の手前に足すフィルター。legacy は空文字（従来と同じコマンド）。"""
+        safety = self.audio_safety
+        if not safety:
+            return ""
+        self.audio_report = dict(safety)
+        if safety["mode"] == AUDIO_HEADROOM:
+            return f",volume=-{safety['headroom_db']:.2f}dB"
+        # limiter: 4 倍に上げてから先読みリミッターをかけ（サンプルの間のピークも捕まえる）、元の周波数へ戻す
+        rate = self.audio_rate(plan[0][0].audio_path)
+        limit = 10 ** ((safety["ceiling_db"] - LIMITER_MARGIN_DB) / 20.0)
+        self.audio_report.update(sample_rate=rate,
+                                 limiter_limit_db=round(safety["ceiling_db"] - LIMITER_MARGIN_DB, 2))
+        return (f",aresample={rate * LIMITER_OVERSAMPLE},"
+                f"alimiter=limit={limit:.6f}:attack=5:release=50:level=0:latency=1,"
+                f"aresample={rate}")
+
+    def audio_rate(self, path: Path) -> int:
+        """曲のサンプルレート（読めなければ 48000）。リミッターの前後で同じ周波数に戻すため。"""
+        probe = Path(self.ffmpeg).with_name("ffprobe" + (".exe" if os.name == "nt" else ""))
+        probe_cmd = str(probe) if probe.is_file() else (shutil.which("ffprobe") or "")
+        if probe_cmd:
+            try:
+                out = subprocess.run(
+                    [probe_cmd, "-v", "error", "-select_streams", "a:0", "-show_entries", "stream=sample_rate",
+                     "-of", "csv=p=0", str(path)], capture_output=True, text=True, timeout=60,
+                    creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0).stdout.strip()
+                rate = int(out.splitlines()[0])
+                if 8000 <= rate <= 192000:
+                    return rate
+            except (OSError, ValueError, IndexError, subprocess.SubprocessError):
+                pass
+        return 48000
+
+    def measure_true_peak(self, path: Path) -> float | None:
+        """書き出した MP4 の音声のトゥルーピーク（dBTP, FFmpeg ebur128）。中止できる。"""
+        stderr = self.run_ffmpeg_cancellable(
+            [self.ffmpeg, "-hide_banner", "-nostats", "-i", str(path), "-map", "0:a:0",
+             "-af", "ebur128=peak=true", "-f", "null", "-"], "音声のピークを測れませんでした")
+        summary = stderr[stderr.rfind("Summary:"):] if "Summary:" in stderr else ""
+        found = re.search(r"True peak:\s*Peak:\s*(-?[\d.]+|-inf)", summary)
+        if not found or found.group(1) == "-inf":
+            return None
+        return round(float(found.group(1)), 2)
 
     def settings_path(self) -> Path:
         """作った動画の隣に置く設定ファイルのパス。"""
@@ -1271,6 +1386,8 @@ class VideoRenderer:
             }
         if self.camera_mode == CAMERA_SUBJECT_SAFE:
             data["safe_framing"] = self.framing_summary()
+        if self.audio_report is not None:
+            data["audio_safety"] = self.audio_report
         if self.transitions is not None:
             data["transitions"] = {
                 "sequence": [{"after_photo": i + 1, "type": t} for i, t in enumerate(self.transitions)],
