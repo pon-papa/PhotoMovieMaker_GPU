@@ -148,5 +148,44 @@ class NvencDetectionTest(unittest.TestCase):
                 r.choose_video_encoder_args()
 
 
+
+class VersionAndDocsTest(unittest.TestCase):
+    """バージョンの正本は pmm_version.py だけ。文書と食い違わないこと。"""
+
+    def test_one_version_everywhere(self):
+        import json
+        import pmm_core as core
+        import pmm_version
+        version = pmm_version.__version__
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$")
+        self.assertEqual(app.APP_VERSION, version)
+        self.assertEqual(core.TOOL_VERSION, version)
+        self.assertEqual(json.loads((ROOT / "tooldock.tool.json").read_text(encoding="utf-8"))["version"], version)
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        self.assertIn(f"バージョン: **v{version}**", readme)
+        self.assertIn(f"PhotoMovieMaker_GPU_v{version}_Windows.zip", readme)
+        self.assertIn(f"## v{version}", (ROOT / "CHANGELOG.md").read_text(encoding="utf-8"))
+        notes = (ROOT / f"RELEASE_NOTES_v{version}.md").read_text(encoding="utf-8")
+        self.assertTrue(notes.startswith(f"# PhotoMovieMaker GPU v{version}"))
+
+    def test_readme_starts_with_what_a_new_user_needs(self):
+        readme = (ROOT / "README.md").read_text(encoding="utf-8")
+        top = readme[:readme.index("## 主な機能")]
+        for word in ("setup.bat", "run.bat", "diagnose.bat", "Python 3.11", "外部へ送信しません", "MP4を作成",
+                     "アンインストール", "ZIP をダウンロードしただけでは動きません"):
+            self.assertIn(word, top)
+        # 一般の利用に、非公開の連携ツールが必要だと読める書き方をしない
+        self.assertNotIn("ToolDock", readme)
+        lowered = readme.lower()
+        for bad in ("smartscreen を無効", "smartscreenを無効にして", "defender を無効にして", "開発中"):
+            self.assertNotIn(bad, lowered)
+
+    def test_supported_python_matches_setup(self):
+        import pmm_version
+        setup = (ROOT / "setup.bat").read_text(encoding="utf-8")
+        lo, hi = pmm_version.SUPPORTED_PYTHON
+        self.assertIn(f"({lo[0]},{lo[1]}) <= sys.version_info[:2] <= ({hi[0]},{hi[1]})", setup)
+        self.assertIn("for %%V in (3.13 3.12 3.11)", setup)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

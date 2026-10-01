@@ -11,7 +11,7 @@
 
 ## このフォルダーにモデルはありますか？
 
-- **配布ZIP（`PhotoMovieMaker_GPU_v0.1.0_Windows.zip` など）を展開した場合**
+- **配布ZIP（`PhotoMovieMaker_GPU_v0.2.0_Windows.zip` など）を展開した場合**
   → すでに同梱済みです。何もしなくて構いません。
 - **GitHubからクローン／ZIPダウンロードした場合**
   → `.onnx` はGit管理外なので入っていません。下の手順で取得してください。
@@ -21,12 +21,12 @@
 | ファイル | 用途 | サイズ | SHA-256 |
 | --- | --- | --- | --- |
 | `face_detection_yunet_2023mar.onnx` | 人物の顔の位置 | 232,589 bytes | `8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4` |
-| `object_detection_yolox_2022nov.onnx` | 犬の位置 | 35,858,002 bytes | `c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063` |
+| `object_detection_yolox_2022nov.onnx` | 犬・人物の位置 | 35,858,002 bytes | `c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe998063` |
 | `dinov2_small_embedding.onnx` | 似た場面の判定（おすすめ解析） | 88,437,819 bytes | `a89a990a98e8022021fd294c94078c8395fc7ae3d59dbc30e80f214ff1b842c5` |
 
 ## 入手元
 
-どちらも [OpenCV Zoo](https://github.com/opencv/opencv_zoo) の配布物です。
+YuNet と YOLOX は [OpenCV Zoo](https://github.com/opencv/opencv_zoo) の配布物です。
 Git LFS で管理されているため、`media.githubusercontent.com` 側のURLから取得します。
 
 ```bash
@@ -69,4 +69,5 @@ curl -L -o models/object_detection_yolox_2022nov.onnx "https://media.githubuserc
 Gitの履歴へ入れると以後ずっとクローンに付いてくるためです。
 
 そのかわり、**GitHub Releases の配布ZIPにはモデルを同梱**しています。
-ZIPを展開すればモデルを別途取得することなく被写体追従を使えます。
+ZIPを展開すればモデルを別途取得することなく被写体追従とおすすめ解析（画像embedding）を使えます。
+モデルがそろっているか・中身が正しいかは、`diagnose.bat` で確かめられます。

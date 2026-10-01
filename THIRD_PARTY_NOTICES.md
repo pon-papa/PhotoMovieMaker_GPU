@@ -4,10 +4,11 @@ PhotoMovieMaker GPU が利用している第三者の成果物と、そのライ
 
 ---
 
-## 検出モデル（被写体追従で使用）
+## 同梱しているモデル
 
-どちらも [OpenCV Zoo](https://github.com/opencv/opencv_zoo) から入手したものです。
-リポジトリ自体は Apache License 2.0 ですが、モデルごとにライセンスが異なります。
+配布 ZIP の `models/` に 3 つのモデルを同梱しています（被写体追従用の 2 つと、おすすめ解析用の 1 つ）。
+YuNet と YOLOX は [OpenCV Zoo](https://github.com/opencv/opencv_zoo) から入手したものです。
+OpenCV Zoo のリポジトリ自体は Apache License 2.0 ですが、モデルごとにライセンスが異なります。
 
 ### YuNet — 人物の顔の位置検出
 
@@ -21,7 +22,7 @@ PhotoMovieMaker GPU が利用している第三者の成果物と、そのライ
 | 再配布 | 可。著作権表示とライセンス本文の同梱が必要 |
 | ライセンス本文 | [licenses/YuNet-MIT.txt](licenses/YuNet-MIT.txt) |
 
-### YOLOX — 犬の位置検出（COCOの dog クラス）
+### YOLOX — 犬・人物の位置検出（COCO の dog / person クラス）
 
 | 項目 | 内容 |
 | --- | --- |
@@ -65,7 +66,7 @@ FAIR Noncommercial Research License ですが、本プロジェクトが使う�
 
 ## 公開・再配布するときの注意
 
-- どちらのライセンスも、MIT / Apache-2.0 という扱いやすい条件です。
+- いずれのライセンスも、MIT / Apache-2.0 という扱いやすい条件です。
   アプリ全体を特定のライセンスへ揃えることを強制するものではありません。
 
 - **モデルを同梱して配布する場合は、このファイルと `licenses/` フォルダーを
@@ -75,15 +76,16 @@ FAIR Noncommercial Research License ですが、本プロジェクトが使う�
     または重要な部分に記載するものとする」と定めています。要約ではなく
     **本文そのもの**が必要なため、`licenses/YuNet-MIT.txt` を同梱しています。
   - Apache-2.0 第4条(a)は「頒布先に本ライセンスの複製を渡さなければならない」
-    と定めています。そのため `licenses/YOLOX-Apache-2.0.txt` を同梱しています。
+    と定めています。そのため `licenses/YOLOX-Apache-2.0.txt` と `licenses/DINOv2-Apache-2.0.txt` を同梱しています。
 
-- Apache-2.0 第4条(b)は改変時の告知を求めますが、
-  本プロジェクトはモデルファイルを**一切改変していません**
-  （OpenCV Zoo が配布するバイナリをそのまま同梱しています）。
+- Apache-2.0 第4条(b)は改変時の告知を求めます。YuNet と YOLOX は**一切改変していません**
+  （OpenCV Zoo が配布するバイナリをそのまま同梱しています）。DINOv2 は ONNX へ書き出しているため、
+  その旨を上の DINOv2 の項に記載しています。
 
 - Apache-2.0 第4条(d)の NOTICE 同梱義務は、配布元に NOTICE ファイルが
-  存在する場合にのみ適用されます。OpenCV Zoo の YOLOX 配布ディレクトリには
-  NOTICE ファイルが**無い**ことを確認済みのため、この義務は発生しません。
+  存在する場合にのみ適用されます。OpenCV Zoo の YOLOX 配布ディレクトリと、
+  DINOv2 のリポジトリ（facebookresearch/dinov2）の直下に NOTICE ファイルが**無い**ことを
+  確認済み（2026-10-01）のため、この義務は発生しません。
 
 - AGPL のモデル・ライブラリ（Ultralytics YOLOv5 / YOLOv8 など）は、
   配布条件がアプリ全体へ波及しうるため採用していません。
@@ -92,12 +94,14 @@ FAIR Noncommercial Research License ですが、本プロジェクトが使う�
 
 ## Python パッケージ
 
-`requirements.txt` に記載のものを利用しています。
+`requirements.txt` に記載のものを利用しています。**配布 ZIP には同梱していません。**
+`setup.bat` を実行したときに、利用者の PC が PyPI から取得します（アプリのフォルダーの中の `.venv` に入ります）。
+それぞれのライセンスは、取得したパッケージに付属するものに従います。
 
 | パッケージ | ライセンス |
 | --- | --- |
 | Pillow | MIT-CMU |
-| NumPy | BSD 3-Clause |
+| NumPy | BSD 3-Clause（同梱の一部に 0BSD / MIT / Zlib / CC0-1.0） |
 | opencv-python | Apache License 2.0 |
 | onnxruntime | MIT License |
 | imageio-ffmpeg | BSD 2-Clause |
@@ -105,8 +109,8 @@ FAIR Noncommercial Research License ですが、本プロジェクトが使う�
 ## FFmpeg
 
 動画のエンコードと音声の合成に FFmpeg を使用します。
-本プロジェクトは FFmpeg 本体を同梱せず、
-PATH 上の FFmpeg か、`imageio-ffmpeg` が持つ FFmpeg を呼び出します。
+本プロジェクトは FFmpeg 本体を同梱せず（配布 ZIP にも入っていません）、
+PATH 上の FFmpeg か、`imageio-ffmpeg` のパッケージに入っている FFmpeg を呼び出します。
 
 FFmpeg のライセンス（LGPL-2.1 以降、ビルド構成によっては GPL）は、
 利用者が導入した FFmpeg ビルドの条件に従います。

@@ -1,8 +1,92 @@
 # PhotoMovieMaker GPU
 
-Windows 11 で、写真フォルダーから記念映像（MP4）を作る小型GUIアプリです。
+Windows 11 用。**写真フォルダーから、パン＆ズーム付きの MP4 スライドショー（記念映像）を作る**小さな GUI アプリです。
 
-バージョン: v0.1.1（+ 開発中のおすすめ解析）
+- **完全にローカルで動きます。** 写真・BGM を外部へ送信しません（通信するのは、最初の setup でパッケージを取得するときだけ）
+- **元の写真・BGM は読むだけ。** 名前の変更・移動・削除・上書きをしません
+- NVIDIA の GPU があれば NVENC で、無ければ CPU で書き出します。どちらでも動きます
+
+バージョン: **v0.2.0**（[変更履歴](CHANGELOG.md)・[リリースノート](RELEASE_NOTES_v0.2.0.md)）
+
+## まず使う
+
+1. [Releases](https://github.com/pon-papa/PhotoMovieMaker_GPU/releases) から `PhotoMovieMaker_GPU_v0.2.0_Windows.zip` をダウンロードする
+2. ZIP を**すべて展開**する（置き場所は自由。ドキュメントなど、自分で書き込める場所へ）
+3. 展開したフォルダーの中の **`setup.bat`** をダブルクリックする（最初の 1 回だけ。数分かかります。インターネット接続が必要）
+4. **`run.bat`** をダブルクリックする（アプリが起動します）
+5. 「写真フォルダー」で写真の入ったフォルダーを選ぶ（必要なら「BGM区間を追加」で曲も選ぶ）
+6. **「MP4を作成」** を押す
+
+必要なのは **Windows 11** と **Python 3.11〜3.13** だけです。Python が入っていなければ、
+先に [python.org](https://www.python.org/downloads/windows/) から入れてください（インストーラーの標準の構成のままで構いません）。
+
+うまくいかないときは、同じフォルダーの **`diagnose.bat`** を実行すると、何が足りないかが表示されます（→ [困ったとき](#困ったとき)）。
+
+> **AI による自動編集について**
+> このアプリは、写真を選ぶ・並べる・曲を選ぶ、といった判断を自動ではしません。画面で人が決めます。
+> 作者の記事などで紹介している「AI が写真と BGM を選んで作品を組み立てる」流れは、このアプリの CLI を
+> 作者の実験用の AI 連携環境から呼び出して行ったもので、**ZIP をダウンロードしただけでは動きません**
+> （→ [開発者向け](#開発者向けai自動化から使う)）。
+
+## 動作環境
+
+| | |
+| --- | --- |
+| OS | Windows 11 |
+| Python | 3.11 / 3.12 / 3.13 に対応する作りです。**動作を確認したのは 3.13**（Microsoft Store 版 3.13.14）。3.11 / 3.12 は未確認です |
+| GPU | 不要。NVIDIA の GPU（NVENC）があれば自動で使います |
+| 通信 | `setup.bat` のときだけ（PyPI からパッケージを取得）。アプリの実行中は通信しません |
+| 権限 | 管理者権限は不要 |
+
+- `setup.bat` は、アプリのフォルダーの中に `.venv` を作り、必要なパッケージを**その中だけ**に入れます。
+  PC 全体の Python には何も入れません。2 回実行しても壊れません
+- 動画のエンコードには FFmpeg を使います。**PATH に FFmpeg があればそれを優先し、無ければ
+  `imageio-ffmpeg` に入っている FFmpeg を使う**ので、別に入れる必要はありません
+- レジストリ・スタートアップ・サービス・Windows の設定は変更しません
+
+作者の確認環境: Windows 11 / Python 3.13 / NVIDIA RTX A2000（NVENC）。1920x1080・30fps・エンコーダ「自動」。
+
+### ZIP を展開するときの注意
+
+インターネットから取得した ZIP や、その中の `setup.bat` / `run.bat` を開くときに、
+Windows がセキュリティの警告を表示することがあります。
+
+- 入手元がこのリポジトリの [Releases](https://github.com/pon-papa/PhotoMovieMaker_GPU/releases) であること、ファイル名が `setup.bat` / `run.bat` /
+  `diagnose.bat` であることを確かめてから実行してください
+- 警告を減らすには、**展開する前に** ZIP を右クリック →「プロパティ」→ 下のほうに「許可する」が
+  あればチェックを入れて「OK」→ そのあと展開します
+- ZIP が本物かどうかは、Releases に載せている SHA-256 と比べて確かめられます
+  （PowerShell で `Get-FileHash PhotoMovieMaker_GPU_v0.2.0_Windows.zip`）
+- **SmartScreen やウイルス対策を無効にする必要はありません。** 無効にしないでください
+
+### アプリが作るもの・触らないもの
+
+| | |
+| --- | --- |
+| 作るもの | 指定した場所の MP4 と、その隣の `<動画名>_settings.json`（どの設定で作ったかの記録） |
+| 一時的に作るもの | 書き出し中の作業ファイル（Windows の一時フォルダー。終わると消します。中止・失敗でも残しません） |
+| setup が作るもの | アプリのフォルダーの中の `.venv` |
+| 触らないもの | 元の写真・BGM（読むだけ） |
+
+**アンインストール**は、展開したフォルダーを削除するだけです（`.venv` もその中にあります）。
+ほかの場所に設定やデータは残りません。
+
+### 困ったとき
+
+`diagnose.bat` をダブルクリックすると、Python・パッケージ・FFmpeg・NVENC・モデルの状態を確かめて表示します。
+何も変更しません。結果にユーザー名やフォルダーの場所は出ないので、そのまま不具合の報告に貼れます。
+
+| 表示・症状 | すること |
+| --- | --- |
+| 「Python 3.11 から 3.13 が見つかりません」 | Python を入れて、もう一度 `setup.bat` |
+| 「まず setup.bat を実行してください」 | `setup.bat` を実行してから `run.bat` |
+| 「パッケージを入れられませんでした」 | インターネット接続を確かめて、もう一度 `setup.bat` |
+| 「既にある .venv が使えません」 | フォルダーの中の `.venv` を削除して、もう一度 `setup.bat` |
+| 診断で「モデル … ありません／中身が違います」 | ZIP が不完全です。Releases から取得し直して、すべて展開 |
+| NVENC が「使えません」 | 問題ではありません。CPU（x264）で書き出します |
+
+不具合は [Issues](https://github.com/pon-papa/PhotoMovieMaker_GPU/issues) へどうぞ（個人の小さなプロジェクトなので、対応を約束するものではありません）。
+報告には、アプリのバージョン・`diagnose.bat` の結果・表示されたエラーを添えてください。**写真や曲そのものは添付しないでください。**
 
 ## 主な機能
 
@@ -17,8 +101,8 @@ Windows 11 で、写真フォルダーから記念映像（MP4）を作る小型
 - BGMを **開始画像～終了画像** の単位で指定
 - BGMは**そっとフェードインして始まり**、曲の変わり目は
   **前曲フェードアウト → 短い無音 → 次曲フェードイン**、最後は**フェードアウトして終わる**
-- NVIDIA NVENC を自動検出し、利用できる環境ではGPUエンコードを優先
-- NVENCが使えない場合はCPU x264へ自動フォールバック
+- NVIDIA NVENC が**実際に使えるか**を確かめ、使える環境では GPU エンコードを優先
+- NVENC が使えない場合（NVIDIA の GPU が無い PC など）は CPU x264 で書き出す
 - **被写体追従カメラ**（実験機能・既定OFF）: 写真に人物の顔か犬が1つだけ写っていれば、
   その方向へゆっくり寄る。判断が曖昧なときは従来方式へ戻る
 - スライドショーを作ると、**そのときの設定をJSONで動画の隣に保存**
@@ -37,46 +121,6 @@ Windows 11 で、写真フォルダーから記念映像（MP4）を作る小型
 
 映像は「無音のMP4を書き出す」→「BGMを合成して最終MP4にする」の2段階で作成します。
 FFmpegへは生フレーム（rawvideo / rgb24）をパイプで渡しています。
-
-## 動作環境
-
-- Windows 11
-- Python 3.11 / 3.12 / 3.13（3.13.14 で動作確認済み）
-- NVIDIA GPU（NVENC対応なら自動でGPUエンコード。無くてもCPUで動作します）
-
-作者の確認環境:
-
-- Xeon E5-2698 v4 ×2
-- NVIDIA RTX A2000 6GB
-- RAM 64GB
-
-この構成では、まず 1920x1080 / 30fps / エンコーダ「自動」で試してください。
-A2000のNVENCが検出されれば映像圧縮はGPU側で行います。
-パン・ズーム処理にはOpenCVを使用し、利用可能なCPUスレッドも使います。
-
-## セットアップ
-
-1. Python 3.11 / 3.12 / 3.13 のいずれかをインストール
-2. `setup.bat` をダブルクリック（`requirements.txt` の依存をインストール）
-3. `run.bat` をダブルクリック（アプリ起動）
-
-依存パッケージ（`requirements.txt`）:
-
-```
-pillow>=10.0
-numpy>=1.26
-opencv-python>=4.9,<6
-imageio-ffmpeg>=0.5
-```
-
-FFmpegは、PATH上にインストール済みのものがあればそれを優先します。
-なければ `imageio-ffmpeg` の同梱FFmpegを使います。
-
-### NVENCについて
-
-「自動」で `h264_nvenc` が検出されればNVENCを使います。
-もしNVENCが検出されない場合は、Windows用のNVENC対応FFmpegを別途インストールして
-PATHを通せば利用できます。
 
 ## 対応ファイル
 
@@ -312,7 +356,7 @@ PATHを通せば利用できます。
 [models/README.md](models/README.md) を見てください。
 
 チェックを入れると、**代替候補のまとめ方**（上で説明した2段構え）になります。
-外すと、v0.1.1 までと同じ従来のまとめ方に戻ります。
+外すと、従来のまとめ方（pHash・色ヒストグラムだけ）に戻ります。
 
 - **画像の内容を言葉で理解しているわけではありません。**
   「結婚式」「犬」といった意味づけはしていません。見た目が近いかどうかだけです
@@ -376,8 +420,8 @@ GUIの「カメラワーク」で切り替えます。**初期値は従来方式
 
 ### 使うモデル
 
-`models` フォルダーへ次の2つを置くと使えるようになります。置き方は
-[models/README.md](models/README.md) を参照してください。
+配布 ZIP には次の 2 つのモデルが同梱されています（ソースを GitHub から取得した場合の置き方は
+[models/README.md](models/README.md)）。
 
 | 用途 | モデル | バージョン | ライセンス |
 | --- | --- | --- | --- |
@@ -399,9 +443,11 @@ PyTorch や TensorFlow は必要ありません。詳細は [THIRD_PARTY_NOTICES
 エンコーダ・カメラワーク、タイトルカードの全項目、BGM全体設定、
 BGM区間（開始/終了の写真番号とファイル名、曲のパス）が入ります。
 
+設定ファイルには、**写真フォルダー・書き出し先・曲の場所（PC 上のパス）が入ります。**
+設定ファイルを人に渡すときは注意してください（動画そのものには入りません）。
+
 実際に上映した順番を `image_order`、一覧の全部と使ったかどうかを `images`
-（`filename` と `included`）として記録します。どちらもファイル名だけで、
-絶対パスは残しません。
+（`filename` と `included`）として記録します。この 2 つはファイル名だけです。
 
 おすすめ解析を実行していた場合は、`photo_recommendations` として
 写真ごとのグループID・星・技術スコアも記録します。
@@ -411,112 +457,6 @@ BGM区間（開始/終了の写真番号とファイル名、曲のパス）が�
 
 被写体追従ONで作った場合は、写真ごとの解析結果
 （顔の数・犬の数・どちらへ寄ったか・目標座標）も記録されます。
-
-## AI・自動化から使う（任意・開発中）
-
-**通常の利用（画面で動画を作る）には、この節の内容は一切不要です。**
-ToolDock・MCP・AI をインストールしなくても、PhotoMovieMaker はこれまでどおり単体で動きます。
-画面はこの節の CLI も `tooldock.tool.json` も読み込まず、通信もしません。
-
-この節は、AI や自動化から操作したい場合だけのものです。
-画面を使わずに、写真の一覧・おすすめ解析・上映計画づくりを呼び出せます。
-AI から使うときは、別リポジトリの ToolDock（MCP Sidecar）がこの CLI を呼び出します。
-MCP の処理は ToolDock 側の役目なので、PhotoMovieMaker に MCP SDK などの追加の依存はありません。
-
-役割分担は次のとおりです。
-
-- **AI（または人）**：何を作るか、どの写真を使うか、どう並べるか、何秒見せるかを決める
-- **PhotoMovieMaker**：決まった内容を、解析・変換・書き出しとして確実に実行する
-
-写真を勝手に外したり並べ替えたりする判断は、PhotoMovieMaker には入れていません。
-
-### JSON CLI
-
-標準出力には JSON だけを出し、進捗は標準エラー出力へ出します。
-
-```powershell
-py -3 pmm_cli.py capabilities
-py -3 pmm_cli.py scan --folder "C:\写真\広島旅行"
-py -3 pmm_cli.py analyze --folder "C:\写真\広島旅行"
-py -3 pmm_cli.py plan --folder "C:\写真\広島旅行" --title "広島旅行" --analyze --save "C:\計画\広島.photomovie.json"
-py -3 pmm_cli.py validate --project "C:\計画\広島.photomovie.json"
-py -3 pmm_cli.py render --project "C:\計画\広島.photomovie.json" --folder "C:\写真\広島旅行" --output "C:\動画\広島.mp4"
-```
-
-| コマンド | 内容 |
-| --- | --- |
-| `capabilities` | できること・対応形式・モデルの有無 |
-| `scan` | フォルダー直下の写真の一覧（名前・大きさ・縦横） |
-| `analyze` | おすすめ解析（代替候補グループ・同じ写真の別バージョン・推奨度・人物/犬の数・撮影時刻） |
-| `plan` | Project JSON（上映計画）の叩き台 |
-| `validate` | Project JSON が正しい形かの確認 |
-| `render` | Project JSON のとおりに MP4 を書き出す（画面と同じ処理） |
-
-終了コードは 0=成功 / 1=処理できなかった / 2=使い方の誤り / 130=中止 です。
-エラーのときも JSON（`"ok": false` と `error.code`）を返します。
-
-- 元の写真は**読むだけ**です。削除・移動・名前の変更・上書きはしません
-- フォルダーの**直下だけ**を見ます。サブフォルダーやドライブ全体は探しません
-- 通信はしません。モデルを実行時にダウンロードすることもありません
-- `render` は画面と同じ `VideoRenderer` で書き出します。同じ設定なら、画面から作った MP4 と同じものになります
-  - 使うのは `enabled: true` の写真だけで、`order` の順に並びます。`video` と `title_card`（被写体追従カメラを含む）は計画どおりです
-  - `--folder` には計画の `source_folder` と同じフォルダーを指定します。写真のフォルダーの中には書き出しません
-  - 書き出しは一時フォルダーで行い、完成した MP4 と `*_settings.json` だけを置きます。中止・失敗のときは何も残しません
-  - 同じ名前のファイルは `--overwrite` を付けない限り上書きしません
-  - BGM 付きも書き出せます。`--music-folder` に計画の `music_folder` と同じ曲のフォルダーを指定し、曲はその直下のものだけを使います（画面と同じ曲の合成）
-- 環境変数 `TOOLDOCK_CANCEL_FILE` が指すファイルが現れると、解析・書き出しを安全に止めます（自動化から使うときだけ。画面には関係しません）
-
-### SI から写真と BGM で作品を組み立てる（SI Director v1）
-
-AI（SI）が写真と BGM の候補を見比べて、選択・順序・選曲・曲の区間・タイトルを決め、
-PhotoMovieMaker がそのとおりに書き出すための部品があります（`music-scan`・`music-analyze`・`compose`・`preview`・`director`）。
-判断は SI 側で、PhotoMovieMaker の中に AI は入っていません。仕組みと約束ごとは [docs/SI_DIRECTOR_V1.md](docs/SI_DIRECTOR_V1.md) にあります。実作品を見て直したところ（安全な構図・つなぎ方・音声の安全・曲のページ送り）は [docs/SI_DIRECTOR_V2.md](docs/SI_DIRECTOR_V2.md)。
-
-### Project JSON（上映計画）
-
-AI と PhotoMovieMaker の間でやり取りする「何をどう上映するか」の計画です。
-ファイル名は `*.photomovie.json` にします。
-
-新しい形式を別に作るのではなく、動画を作ったときに保存する
-`*_settings.json` と**同じ区画名・同じ中身**（`video`・`title_card`・`bgm_timing`・`bgm_segments`）を使っています。
-
-```json
-{
-  "kind": "photomoviemaker.project",
-  "schema_version": 1,
-  "project": {"title": "広島旅行", "source_folder": "C:\\写真\\広島旅行", "target_duration_seconds": 240},
-  "media": [
-    {"file": "001.jpg", "type": "image", "enabled": true, "order": 1,
-     "candidate_group": "G01", "variant_family": null, "stars": 3}
-  ],
-  "video": {"width": 1920, "height": 1080, "fps": 30, "interval_seconds": 8.0,
-            "transition_seconds": 1.0, "zoom_percent": 8.0, "blur_background": true,
-            "camera_mode": "legacy", "encoder_choice": "auto"},
-  "title_card": {"enabled": true, "main": "広島旅行", "...": "..."},
-  "bgm_timing": {"first_offset": 3.0, "...": "..."},
-  "bgm_segments": [],
-  "recommendation_engine": {"grouping": "selection_candidate_groups", "...": "..."},
-  "extensions": {}
-}
-```
-
-- `media[].file` はファイル名だけです（フォルダーの外を指す指定は受け付けません）
-- 叩き台では、写真はすべて `enabled: true`・フォルダーの順です。外す・並べ替えるのは計画を書く側です
-- `type` は今は `image` だけを扱います。`video`（写真の間に挟む動画）は将来のために形だけ用意しています
-- トランジションの種類や、曲の拍・小節に合わせた演出などは、将来 `extensions` に入れる予定です
-- `project.source_folder` には写真フォルダーの絶対パスが入ります。共有するときは注意してください
-
-### ToolDock から見つけてもらうための manifest
-
-フォルダー直下の `tooldock.tool.json` に、この CLI でできること（操作・入力と出力の形・
-読むだけか書くか・どの引数がフォルダーやファイルか）を、ToolDock Connector v1 の形式で書いてあります。
-
-- ToolDock はこのファイルを読むだけで、PhotoMovieMaker を起動せずに能力を知ることができます
-- AI から使うときも、ToolDock の汎用の仕組みがこの宣言どおりに CLI を呼び出します。
-  PhotoMovieMaker 専用のコードは ToolDock 側にありません
-- 宣言と CLI が食い違わないことは、`tests/test_external_api.py` で確かめています
-- このファイルが無くても・壊れていても、画面と CLI の動作には影響しません。
-  ToolDock・MCP が無い状態で画面・CLI・動画書き出しが動くことは `tests/test_standalone.py` で確かめています
 
 ## BGM区間の指定例
 
@@ -575,28 +515,42 @@ AI と PhotoMovieMaker の間でやり取りする「何をどう上映するか
 動画の長さは **タイトル表示時間 + 写真枚数 × 写真の間隔** です。
 写真クロスフェードやタイトル→写真フェードで長さが伸びることはありません。
 
-## 注意
+## 既知の制限
 
-初版では人物の顔認識まではしていません。
-そのためパン方向は「上品に見えやすい方向セット」から選びます。
-パン方向は固定シードで決めているため、同じ素材なら同じ結果になります。
+- Windows 11 向けです。ほかの OS では確認していません
+- Python が必要です（exe やインストーラーの形ではありません）。確認済みは Python 3.13 だけです
+- 写真ごとに表示時間を変えることはできません（決められるのは全体で 1 つの「写真の間隔」）
+- BGM のテンポ（BPM）に合わせた切り替えはありません。BGM は必ず曲の先頭から使います
+- 画面からの BGM の音量調整・リミッターはありません（元の曲の音量のまま合成します）
+- 被写体の検出は完全ではありません。顔や犬を見落とすこと、関係のないものを拾うことがあります
+- 被写体追従カメラ（実験機能）は顔・犬の方向へ寄るだけです。全身や衣装の端が画面の外へ出ることがあります。
+  人物全体・犬全体をできるだけ画面に残す `subject_safe` は、今の版では CLI / Project JSON からだけ使えます
+  （それも、検出できた範囲をできるだけ残す機能で、ドレスの裾などを必ず全部残すものではありません）
+- つなぎ方の種類（カット・暗転・スライド）と音声のリミッターも、今の版では CLI / Project JSON からだけです。
+  画面から作る動画は、これまでどおりクロスフェードです
+
+## 開発者向け（AI・自動化から使う）
+
+**通常の利用（画面で動画を作る）には、この節の内容は一切不要です。**
+
+画面を使わずに、写真の一覧・おすすめ解析・曲の測定・上映計画（Project JSON）の組み立て・書き出しを
+呼び出せる JSON CLI（`pmm_cli.py`）と Core API（`pmm_core.py`）が入っています。
+写真を選ぶ・並べる・曲を選ぶといった判断は呼び出す側（人や AI）が行い、PhotoMovieMaker はそのとおりに
+確実に書き出すだけです。**PhotoMovieMaker の中に AI は入っていません。**
+
+- 使い方: [docs/DEVELOPER.md](https://github.com/pon-papa/PhotoMovieMaker_GPU/blob/main/docs/DEVELOPER.md)
+- AI（SI）が作品を組み立てるための部品と約束ごと:
+  [docs/SI_DIRECTOR_V1.md](https://github.com/pon-papa/PhotoMovieMaker_GPU/blob/main/docs/SI_DIRECTOR_V1.md)・
+  [docs/SI_DIRECTOR_V2.md](https://github.com/pon-papa/PhotoMovieMaker_GPU/blob/main/docs/SI_DIRECTOR_V2.md)
+
+作者の記事で行った「AI が写真を選ぶ・124 曲を比べる・Project を組み立てる」は、この CLI を作者の実験用の
+AI 連携環境（非公開）から呼び出したものです。その連携環境は配布物に含まれません。
+このアプリの通常利用に、それらは必要ありません。
 
 ## ライセンス
 
 MIT License — [LICENSE](LICENSE) を参照してください。
 
-同梱・利用している第三者の成果物（検出モデル、Pythonパッケージ、FFmpeg）の
-ライセンスは [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にまとめてあります。
-検出モデルは YuNet が MIT、YOLOX が Apache-2.0 で、
-それぞれのライセンス本文を [licenses/](licenses/) に同梱しています。
-
-## 次の改良候補
-
-- 顔認識して、人物をフレーム外へ追い出さない自動パン
-- 写真ごとの表示時間変更
-- BGMの音量調整
-- BGMの任意開始位置
-- エンドロール
-- 被写体追従の対象を増やす（猫など）
-- 低解像度プレビュー出力
-- EXE化
+同梱しているモデル（YuNet: MIT、YOLOX: Apache-2.0、DINOv2: Apache-2.0）のライセンス本文は
+[licenses/](licenses/) に、入手元・権利者・Python パッケージと FFmpeg の扱いは
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) にまとめてあります。
