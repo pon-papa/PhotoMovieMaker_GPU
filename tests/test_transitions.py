@@ -7,14 +7,26 @@
     py -3 -m unittest discover -s tests
 """
 
+import hashlib
+import os
+import subprocess
 import sys
+import tempfile
+import threading
 import unittest
 from pathlib import Path
+from queue import Queue
+
+import numpy as np
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
+import PhotoMovieMaker_GPU as app  # noqa: E402
 import pmm_core as core  # noqa: E402
+
+FLAGS = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
 
 CALM = {"crossfade": 0.8, "cut": 0.1, "fade_black": 0.1}
 DYNAMIC = {"crossfade": 0.5, "cut": 0.25, "slide": 0.2, "fade_black": 0.05}
@@ -138,6 +150,71 @@ class ProjectFieldTest(unittest.TestCase):
                     dict(ok, extra=1)):
             with self.subTest(bad=bad):
                 self.assertTrue(core.validate_project(self.project(transitions=bad)))
+
+
+class RendererTransitionTest(unittest.TestCase):
+    """各つなぎ方を短い合成動画で書き出し、フレーム数・長さ・境目の画を確かめる。"""
+    W, H = 160, 90
+    COLORS = [(255, 0, 0), (0, 255, 0), (0, 0, 255)]
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory(prefix="pmm transition 試験 — ")
+        self.addCleanup(self._tmp.cleanup)
+        self.dir = Path(self._tmp.name)
+        self.paths = []
+        for k, color in enumerate(self.COLORS, 1):
+            path = self.dir / f"写真 {k}.png"
+            Image.new("RGB", (self.W, self.H), color).save(path)
+            self.paths.append(path)
+
+    def render(self, transitions, name):
+        r = app.VideoRenderer(
+            image_paths=self.paths, output_path=self.dir / name, width=self.W, height=self.H, fps=10,
+            interval_seconds=1.0, transition_seconds=0.4, zoom_percent=0.0, blur_background=False,
+            bgm_segments=[], encoder_pref="cpu", q=Queue(), stop_event=threading.Event(), title=None,
+            transitions=transitions)
+        r.run()
+        return r
+
+    def frames(self, path):
+        proc = subprocess.run([app.find_ffmpeg(), "-v", "error", "-i", str(path), "-f", "rawvideo",
+                               "-pix_fmt", "rgb24", "-"], capture_output=True, creationflags=FLAGS)
+        self.assertEqual(proc.stderr, b"")                       # 壊れていない（デコードのエラーが無い）
+        return np.frombuffer(proc.stdout, np.uint8).reshape(-1, self.H, self.W, 3).astype(int)
+
+    def near(self, pixels, color, tol=40):
+        return bool(np.all(np.abs(pixels.reshape(-1, 3).mean(axis=0) - np.array(color)) < tol))
+
+    def test_each_type_keeps_length_and_draws_the_boundary(self):
+        red, green, black = self.COLORS[0], self.COLORS[1], (0, 0, 0)
+        for kind in app.TRANSITION_TYPES:
+            with self.subTest(kind=kind):
+                r = self.render([kind, "crossfade"], f"{kind}.mp4")
+                f = self.frames(r.output)
+                self.assertEqual(len(f), 30)                          # 1 秒 × 3 枚 × 10 fps（つなぎ方で変わらない）
+                self.assertEqual(r.total_frames, 30)
+                self.assertTrue(self.near(f[5], red) and self.near(f[10], green))
+                if kind == "cut":
+                    self.assertTrue(self.near(f[9], red))            # 境目の直前まで写真 1 だけ
+                elif kind == "fade_black":
+                    self.assertTrue(self.near(f[7], black, 20))      # 途中で黒になる
+                elif kind == "slide":
+                    self.assertTrue(self.near(f[7][:, :60], red) and self.near(f[7][:, 100:], green))
+                else:
+                    self.assertFalse(self.near(f[8], red) or self.near(f[8], green))   # 混ざっている
+                settings = r.settings_path().read_text(encoding="utf-8")
+                self.assertIn(f'"{kind}"', settings)
+
+    def test_no_sequence_equals_all_crossfade(self):
+        a = self.render(None, "なし.mp4")
+        b = self.render(["crossfade", "crossfade"], "クロスフェード.mp4")
+        sha = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()   # noqa: E731
+        self.assertEqual(sha(a.output), sha(b.output))
+
+    def test_wrong_length_is_refused(self):
+        for bad in (["crossfade"], ["crossfade", "zoom"]):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                self.render(bad, "x.mp4")
 
 
 PINNED_CALM_12_SEED_1 = ["cut"] + ["crossfade"] * 8 + ["fade_black", "crossfade"]   # 実装時に計算して固定

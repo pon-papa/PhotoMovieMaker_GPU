@@ -282,6 +282,7 @@ class VideoRenderer:
         bgm_timing: "BGMTiming | None" = None,
         camera_mode: str = CAMERA_LEGACY,
         settings_extra: dict | None = None,
+        transitions: list[str] | None = None,
     ):
         self.images = image_paths
         self.output = output_path
@@ -301,6 +302,14 @@ class VideoRenderer:
         self.bgm_timing = bgm_timing or BGMTiming()
         self.camera_mode = camera_mode
         self.settings_extra = settings_extra or {}
+        # 写真の境目ごとのつなぎ方（i 番目 = 写真 i+1 → i+2）。None なら従来どおりすべてクロスフェード。
+        # 種類は Project を組み立てるときに確定済み。ここでは決めず、そのとおりに描くだけ。
+        if transitions is not None:
+            transitions = list(transitions)
+            if (len(transitions) != max(0, len(image_paths) - 1)
+                    or any(t not in TRANSITION_TYPES for t in transitions)):
+                raise ValueError("写真のつなぎ方の並びが写真の枚数と合いません。")
+        self.transitions = transitions
         # 写真ごとの解析結果。画像は持たず、bbox由来の軽い値だけ。
         # 並べ替えても別の写真へ結果が付かないよう、キーは写真のパスにする。
         self.detections: dict[str, object] = {}
@@ -765,6 +774,34 @@ class VideoRenderer:
             borderMode=cv2.BORDER_REFLECT_101,
         )
 
+    def special_transition(self, kind: str, frame: np.ndarray, next_canvas: np.ndarray,
+                           next_motion: Motion, local: int) -> np.ndarray:
+        """クロスフェード以外のつなぎ方。境目の手前 transition 秒（クロスフェードと同じ区間）の中だけで描く。
+
+        - cut: 混ぜない。次の写真は自分の区間の先頭から始まる（総フレーム数は変わらない）
+        - fade_black: 前半で黒へ、後半で黒から次の写真へ
+        - slide: 次の写真が右から入り、今の写真を左へ押し出す"""
+        if kind == TRANSITION_CUT:
+            return frame
+        T = self.transition_frames
+        k = local - (self.interval_frames - T)
+        nxt = self.render_motion(next_canvas, next_motion, k - T)
+        if kind == TRANSITION_FADE_BLACK:
+            first = T // 2
+            if k < first:
+                a = smoothstep((k + 1) / first)
+                return cv2.addWeighted(frame, 1.0 - a, frame, 0.0, 0.0)
+            a = smoothstep((k - first + 1) / (T - first))
+            return cv2.addWeighted(nxt, a, nxt, 0.0, 0.0)
+        if kind == TRANSITION_SLIDE:
+            off = int(round(smoothstep((k + 1) / T) * self.w))
+            if off <= 0:
+                return frame
+            if off >= self.w:
+                return nxt
+            return np.ascontiguousarray(np.concatenate([frame[:, off:], nxt[:, :off]], axis=1))
+        raise ValueError(f"知らないつなぎ方です: {kind}")
+
     def choose_video_encoder_args(self) -> tuple[str, list[str]]:
         pref = self.encoder_pref.lower()
 
@@ -902,7 +939,16 @@ class VideoRenderer:
                     # interval末尾 transition 秒で次の写真へクロスフェード。
                     # 次写真の「本来の開始」は i+1 の8秒境界。
                     # その手前から先取りしてフェードさせる。
+                    kind = (self.transitions[i] if (self.transitions and next_canvas is not None)
+                            else TRANSITION_CROSSFADE)
                     if (
+                        next_canvas is not None
+                        and self.transition_frames > 0
+                        and local >= self.interval_frames - self.transition_frames
+                        and kind != TRANSITION_CROSSFADE
+                    ):
+                        frame = self.special_transition(kind, frame, next_canvas, motions[i + 1], local)
+                    elif (
                         next_canvas is not None
                         and self.transition_frames > 0
                         and local >= self.interval_frames - self.transition_frames
@@ -1225,6 +1271,12 @@ class VideoRenderer:
             }
         if self.camera_mode == CAMERA_SUBJECT_SAFE:
             data["safe_framing"] = self.framing_summary()
+        if self.transitions is not None:
+            data["transitions"] = {
+                "sequence": [{"after_photo": i + 1, "type": t} for i, t in enumerate(self.transitions)],
+                "counts": {t: self.transitions.count(t) for t in TRANSITION_TYPES if t in self.transitions},
+                "seconds": self.transition_frames / self.fps,
+            }
 
         data.update(self.settings_extra)
 

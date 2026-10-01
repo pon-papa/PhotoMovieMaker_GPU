@@ -1086,6 +1086,8 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
             q=q, stop_event=stop_event,
             title=plan["title"], bgm_timing=plan["timing"],
             camera_mode=video["camera_mode"],
+            # transitions が無い Project（v1）は None のまま＝従来どおりクロスフェードだけ
+            transitions=transition_sequence(project) if "transitions" in project else None,
             settings_extra={
                 # 設定ファイルには、一時フォルダーではなく実際の書き出し先を残す
                 "output": str(target),
@@ -1166,6 +1168,8 @@ def render_project(project_file, photo_folder, output_file, *, overwrite: bool =
         "subject_camera": detections or None,
         "safe_framing": ({k: v for k, v in renderer.framing_summary().items() if k != "photos"}
                          if renderer.camera_mode == app.CAMERA_SUBJECT_SAFE else None),
+        "transitions": ({t: renderer.transitions.count(t) for t in TRANSITION_TYPES if t in renderer.transitions}
+                        if renderer.transitions is not None else None),
         "title_card": bool(renderer.title),
         "bgm_tracks": [s.audio_path.name for s in plan["segments"]],
         "encoder_used": renderer.encoder_used,
