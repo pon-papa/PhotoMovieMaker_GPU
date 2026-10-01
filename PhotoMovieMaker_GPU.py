@@ -241,17 +241,39 @@ def find_ffmpeg() -> str:
     )
 
 
+_NVENC_USABLE: dict[str, bool] = {}
+
+
 def ffmpeg_has_nvenc(ffmpeg: str) -> bool:
+    """NVENC（h264_nvenc）が実際に使えるか。
+
+    エンコーダーの一覧に名前があるだけでは足りない。imageio-ffmpeg の FFmpeg にも h264_nvenc は
+    入っているので、NVIDIA の GPU が無い PC でも一覧には出る。その状態で「自動」が NVENC を選ぶと
+    書き出しが失敗するため、ごく小さな試し書き出しで確かめる（結果は FFmpeg ごとに覚えておく）。
+    使えなければ False を返し、呼び出し側は CPU（libx264）を使う。"""
+    if ffmpeg in _NVENC_USABLE:
+        return _NVENC_USABLE[ffmpeg]
+    flags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+    usable = False
     try:
         r = subprocess.run(
             [ffmpeg, "-hide_banner", "-encoders"],
             capture_output=True, text=True, timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+            creationflags=flags,
         )
         txt = (r.stdout or "") + (r.stderr or "")
-        return "h264_nvenc" in txt
+        if "h264_nvenc" in txt:
+            probe = subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-f", "lavfi",
+                 "-i", "color=c=black:s=256x256:r=30:d=0.2", "-c:v", "h264_nvenc", "-f", "null", "-"],
+                capture_output=True, text=True, timeout=30,
+                creationflags=flags,
+            )
+            usable = probe.returncode == 0
     except Exception:
-        return False
+        usable = False
+    _NVENC_USABLE[ffmpeg] = usable
+    return usable
 
 
 @dataclass
