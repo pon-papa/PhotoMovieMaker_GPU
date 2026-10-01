@@ -7,6 +7,8 @@ set "VENV_PY=%APP_DIR%.venv\Scripts\python.exe"
 if not exist "%VENV_PY%" goto :no_venv
 if not exist "%APP_DIR%PhotoMovieMaker_GPU.py" goto :incomplete
 cd /d "%APP_DIR%"
+rem OpenCV の情報・警告の行をコンソールに出さない（エラーは出ます）
+set "OPENCV_LOG_LEVEL=ERROR"
 "%VENV_PY%" "%APP_DIR%PhotoMovieMaker_GPU.py"
 if errorlevel 1 goto :failed
 endlocal

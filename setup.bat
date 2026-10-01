@@ -16,6 +16,8 @@ echo.
 
 if not exist "%APP_DIR%PhotoMovieMaker_GPU.py" goto :incomplete
 if not exist "%APP_DIR%requirements.txt" goto :incomplete
+if not exist "%APP_DIR%app_doctor.py" goto :incomplete
+set "PYTHONUTF8=1"
 
 set "VENV_PY=%APP_DIR%.venv\Scripts\python.exe"
 if exist "%VENV_PY%" goto :check_venv
@@ -49,7 +51,7 @@ echo [3/4] 必要なパッケージを入れています / installing packages .
 "%VENV_PY%" -m pip install --disable-pip-version-check -r "%APP_DIR%requirements.txt"
 if errorlevel 1 goto :pip_failed
 echo [4/4] 確認しています / checking ...
-"%VENV_PY%" -c "import PIL, numpy, cv2, imageio_ffmpeg, tkinter"
+"%VENV_PY%" "%APP_DIR%app_doctor.py" --brief
 if errorlevel 1 goto :check_failed
 
 echo.

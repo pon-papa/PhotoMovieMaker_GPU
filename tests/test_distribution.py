@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 import PhotoMovieMaker_GPU as app  # noqa: E402
 
-BATS = ("setup.bat", "run.bat")
+BATS = ("setup.bat", "run.bat", "diagnose.bat")
 # 配布物がしてはいけないこと（レジストリ・タスク・サービス・実行ポリシー・Defender・SmartScreen）
 FORBIDDEN = ("reg add", "reg delete", "schtasks", "sc create", "sc config", "set-executionpolicy",
              "add-mppreference", "smartscreen", "powershell", "netsh", "bcdedit", "runas")

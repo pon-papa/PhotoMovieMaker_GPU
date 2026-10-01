@@ -2,7 +2,7 @@
   "connector_version": 1,
   "tool_id": "photomoviemaker-gpu",
   "name": "PhotoMovieMaker GPU",
-  "version": "0.1.1+external-api",
+  "version": "0.2.0",
   "api_version": 1,
   "description": "写真フォルダーからMP4スライドショーを作るローカルツール。写真の解析・代替候補グループ・上映計画（Project JSON）・計画どおりの MP4 書き出しをCLIから利用できます。元の写真は読むだけです。",
   "namespace": "slideshow",

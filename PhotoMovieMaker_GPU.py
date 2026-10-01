@@ -63,6 +63,8 @@ except Exception:
     photo_embedding = None
 
 
+from pmm_version import __version__ as APP_VERSION   # バージョンの正本は pmm_version.py
+
 APP_NAME = "PhotoMovieMaker GPU"
 
 # カメラワーク。既定は従来方式で、何も設定しなければ今までと同じ結果になる。
@@ -1346,6 +1348,7 @@ class VideoRenderer:
         names = [p.name for p in self.images]
         data = {
             "app": APP_NAME,
+            "app_version": APP_VERSION,
             "saved_at": datetime.now().isoformat(timespec="seconds"),
             "output": str(self.output),
             "photos": {
@@ -1986,7 +1989,7 @@ class BGMDialog(tk.Toplevel):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title(APP_NAME)
+        self.title(f"{APP_NAME} v{APP_VERSION}")
         # 大きい画面では今までどおりの見やすさ、
         # 小さい画面や表示倍率が高い環境では画面に収まる大きさで開く。
         # 足りないぶんは縦スクロールで届く。

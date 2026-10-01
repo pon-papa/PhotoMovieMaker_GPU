@@ -52,7 +52,7 @@ API_VERSION = 1
 PROJECT_KIND = "photomoviemaker.project"
 PROJECT_SCHEMA_VERSION = 1
 PROJECT_SUFFIX = ".photomovie.json"
-TOOL_VERSION = "0.1.1+external-api"
+TOOL_VERSION = app.APP_VERSION        # バージョンの正本は pmm_version.py
 
 # GUI の既定値と同じにしておく（PhotoMovieMaker_GPU.App の初期値）
 DEFAULT_VIDEO = {
