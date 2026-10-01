@@ -15,6 +15,7 @@ Tk の画面は一切作りません。
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -657,6 +658,142 @@ def _validate_segments(project: dict, problems: list[str]) -> None:
             problems.append(f"bgm_segments[{a}] と bgm_segments[{b}] の写真の範囲が重なっています。")
 
 
+# ------------------------------------------------------------------
+# 写真と写真のつなぎ方（SI Director v2）
+# SI が作品ごとに確率（transition_profile）を決め、ここで写真の境目ごとの種類を一度だけ確定して
+# Project に保存する。書き出しは保存された順番（sequence）を再生するだけで、乱数は引かない。
+# ------------------------------------------------------------------
+
+TRANSITION_TYPES = app.TRANSITION_TYPES
+TRANSITION_SPECIAL = {app.TRANSITION_FADE_BLACK, app.TRANSITION_SLIDE}   # 続けて使わない（目立つもの）
+TRANSITION_KEYS = {"profile", "seed", "overrides", "sequence", "method"}
+TRANSITION_METHOD = "sha256(seed:boundary) + constraints v1"
+MAX_SEED = 2 ** 63 - 1
+
+
+def _transition_problems(block, photo_count: int | None) -> list[str]:
+    """Project の transitions（または compose の edits.transitions）を確かめる。"""
+    problems: list[str] = []
+    if not isinstance(block, dict) or set(block) - TRANSITION_KEYS:
+        return [f"transitions の項目が不正です（使える項目: {sorted(TRANSITION_KEYS)}）。"]
+    profile = block.get("profile")
+    if profile is not None:
+        if not isinstance(profile, dict) or not profile:
+            problems.append("transitions.profile は {種類: 確率} のオブジェクトです。")
+        else:
+            unknown = sorted(set(profile) - set(TRANSITION_TYPES))
+            if unknown:
+                problems.append(f"transitions.profile に知らない種類があります: {unknown}（使える種類: {list(TRANSITION_TYPES)}）")
+            values = list(profile.values())
+            if not all(_number(v, 0, 1) for v in values):
+                problems.append("transitions.profile の確率は 0〜1 の数です（負の値は使えません）。")
+            elif abs(sum(values) - 1.0) > 1e-6:
+                problems.append(f"transitions.profile の確率の合計は 1.0 にしてください（今は {sum(values):.6g}）。")
+    seed = block.get("seed")
+    if seed is not None and not (isinstance(seed, int) and not isinstance(seed, bool) and 0 <= seed <= MAX_SEED):
+        problems.append(f"transitions.seed は 0〜{MAX_SEED} の整数です。")
+    overrides = block.get("overrides")
+    if overrides is not None:
+        if not isinstance(overrides, list):
+            problems.append("transitions.overrides は [{after_photo, type}] の配列です。")
+        else:
+            seen = set()
+            for i, o in enumerate(overrides, 1):
+                where = f"transitions.overrides[{i}]"
+                if not isinstance(o, dict) or set(o) != {"after_photo", "type"}:
+                    problems.append(f"{where} は {{after_photo, type}} です。")
+                    continue
+                if o["type"] not in TRANSITION_TYPES:
+                    problems.append(f"{where}.type は {list(TRANSITION_TYPES)} のどれかです。")
+                k = o["after_photo"]
+                if not _position(k) or (photo_count is not None and k > photo_count - 1):
+                    problems.append(f"{where}.after_photo は 1〜{max(0, (photo_count or 0) - 1)}（何枚目の写真の後か）です。")
+                elif k in seen:
+                    problems.append(f"{where}.after_photo {k} が重複しています。")
+                seen.add(k)
+    sequence = block.get("sequence")
+    if sequence is not None:
+        if not isinstance(sequence, list) or not all(t in TRANSITION_TYPES for t in sequence):
+            problems.append(f"transitions.sequence は {list(TRANSITION_TYPES)} の配列です。")
+        elif photo_count is not None and len(sequence) != max(0, photo_count - 1):
+            problems.append(f"transitions.sequence は写真の境目の数（{max(0, photo_count - 1)}）と同じ長さにしてください"
+                            f"（今は {len(sequence)}）。")
+        elif isinstance(overrides, list):
+            for o in overrides:
+                if isinstance(o, dict) and _position(o.get("after_photo")) and o["after_photo"] <= len(sequence) \
+                        and sequence[o["after_photo"] - 1] != o.get("type"):
+                    problems.append(f"transitions.sequence の {o['after_photo']} 枚目の後が overrides と違います。")
+    return problems
+
+
+def _boundary_draw(seed: int, boundary: int) -> float:
+    """境目ごとの 0〜1 の値。seed と境目の番号だけで決まる（Python の版・実行のたびに変わらない）。"""
+    digest = hashlib.sha256(f"pmm-transition:{seed}:{boundary}".encode("ascii")).digest()
+    return int.from_bytes(digest[:8], "big") / 2 ** 64
+
+
+def _transition_allowed(kind: str, boundary: int, chosen: dict[int, str]) -> bool:
+    """最低限の連続の決まり。chosen は確定した境目（指定 overrides を含む）。"""
+    if boundary == 1 and kind in TRANSITION_SPECIAL:
+        return False                      # タイトルの直後（写真 1 → 2）は目立つつなぎ方を避ける
+    if kind in TRANSITION_SPECIAL and kind in (chosen.get(boundary - 1), chosen.get(boundary + 1)):
+        return False                      # 暗転・スライドを続けない
+    if kind != app.TRANSITION_CROSSFADE:
+        if chosen.get(boundary - 1) == kind and chosen.get(boundary - 2) == kind:
+            return False                  # 同じ特別なつなぎ方を 3 回続けない
+        if chosen.get(boundary - 1) == kind and chosen.get(boundary + 1) == kind:
+            return False
+        if chosen.get(boundary + 1) == kind and chosen.get(boundary + 2) == kind:
+            return False
+    return True
+
+
+def plan_transitions(photo_count: int, profile: dict, seed: int, overrides=None) -> list[str]:
+    """写真の境目（photo_count - 1 か所）ごとのつなぎ方を確定する。乱数は使わない。
+
+    - overrides（SI が境目を指定したもの）を最優先でそのまま使う
+    - 残りの境目は profile の確率で選ぶ。値は seed と境目の番号の SHA-256 から作る
+    - 決まりに合わない種類は外して確率を配り直す。何も残らなければクロスフェード
+    同じ枚数・同じ profile・同じ seed・同じ overrides なら、いつも同じ並びになる。"""
+    block = {"profile": profile, "seed": seed, "overrides": overrides or []}
+    problems = _transition_problems(block, photo_count)
+    if problems:
+        raise CoreError("invalid_transitions", " / ".join(problems))
+    chosen = {o["after_photo"]: o["type"] for o in overrides or []}
+    order = [t for t in TRANSITION_TYPES if profile.get(t, 0) > 0]
+    for boundary in range(1, photo_count):
+        if boundary in chosen:
+            continue
+        allowed = [t for t in order if _transition_allowed(t, boundary, chosen)]
+        total = sum(profile[t] for t in allowed)
+        kind = app.TRANSITION_CROSSFADE
+        if allowed and total > 0:
+            u, acc = _boundary_draw(seed, boundary) * total, 0.0
+            kind = allowed[-1]
+            for t in allowed:
+                acc += profile[t]
+                if u < acc:
+                    kind = t
+                    break
+        chosen[boundary] = kind
+    return [chosen[b] for b in range(1, photo_count)]
+
+
+def default_transition_seed(selected: list[str], profile: dict) -> int:
+    """seed が指定されないときの seed。使う写真の並びと profile から決める（保存して固定する）。"""
+    text = json.dumps({"selected": selected, "profile": profile}, ensure_ascii=False, sort_keys=True)
+    return int.from_bytes(hashlib.sha256(text.encode("utf-8")).digest()[:8], "big") & MAX_SEED
+
+
+def transition_sequence(project: dict) -> list[str]:
+    """書き出しで使う境目ごとのつなぎ方。transitions が無い Project（v1）はすべてクロスフェード。"""
+    block = project.get("transitions")
+    count = len(shown_files(project))
+    if not isinstance(block, dict) or "sequence" not in block:
+        return [app.TRANSITION_CROSSFADE] * max(0, count - 1)
+    return list(block["sequence"])
+
+
 def validate_project(project) -> list[str]:
     """Project JSON を確かめて、問題点の一覧を返す（空なら問題なし）。"""
     problems: list[str] = []
@@ -730,6 +867,12 @@ def validate_project(project) -> list[str]:
         if not isinstance(block, dict) or set(block) - known:
             problems.append(f"{key} の項目が不正です（使える項目: {sorted(known)}）。")
     _validate_segments(project, problems)
+    if "transitions" in project:
+        block = project["transitions"]
+        found = _transition_problems(block, len(shown_files(project)))
+        if not found and "sequence" not in block:
+            found = ["transitions.sequence（境目ごとのつなぎ方。compose で確定する）が必要です。"]
+        problems.extend(found)
     return problems
 
 
