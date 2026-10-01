@@ -80,6 +80,70 @@ print("RESULT " + json.dumps({
     "detections": sorted({d.mode for d in r.detections.values()}), "version": app.APP_VERSION}))
 '''
 
+GUI_FLOW = r'''
+import json, sys, time
+from pathlib import Path
+
+app_dir, photos, music, out_dir = sys.argv[1:5]
+sys.path.insert(0, app_dir)
+import PhotoMovieMaker_GPU as app
+
+shown = []                                          # 確認の窓は出さずに、文面だけ記録する
+for name in ("showinfo", "showwarning", "showerror"):
+    setattr(app.messagebox, name, lambda title, text="", _n=name, **k: shown.append((_n, str(text))))
+
+
+def pump(window, until, seconds):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline and not until():
+        window.update()
+        time.sleep(0.02)
+    return until()
+
+
+window = app.App()
+window.folder_var.set(photos)                       # 写真フォルダーを選ぶ
+window.load_images()
+names = [p.name for p in window.images]
+window.images = [window.images[1], window.images[0]] + window.images[2:]     # 並べ替え（1 枚目と 2 枚目を入れ替え）
+window.excluded.add(window.images[3])               # 4 枚目は使わない
+window.update_summary()
+window.bgm_segments.append(app.BGMSegment(0, 2, Path(music)))                # BGM 区間（使う写真の 1〜3 枚目）
+window.refresh_bgm_tree()
+window.interval_var.set(2.0)
+window.transition_var.set(0.5)
+window.fps_var.set(24)
+window.encoder_var.set("CPU x264")
+window.title_main_var.set("画面の試験")
+window.title_dur_var.set(2.0)
+window.title_text_fade_var.set(1.0)
+first = Path(out_dir) / "画面から作成.mp4"
+window.output_var.set(str(first))
+window.start()                                      # 「MP4を作成」
+done = pump(window, lambda: str(window.start_btn["state"]) == "normal" and window.worker is not None
+            and not window.worker.is_alive(), 300)
+pump(window, lambda: False, 0.5)
+settings = json.loads(first.with_name(first.stem + "_settings.json").read_text(encoding="utf-8")) if done else {}
+
+second = Path(out_dir) / "中止する動画.mp4"         # 「中止」
+window.interval_var.set(8.0)
+window.output_var.set(str(second))
+window.start()
+pump(window, lambda: False, 1.5)
+window.cancel()
+cancelled = pump(window, lambda: not window.worker.is_alive() and str(window.start_btn["state"]) == "normal", 60)
+status = window.status.cget("text")
+title = window.title()
+window.destroy()
+print("RESULT " + json.dumps({
+    "title": title, "loaded": names, "done": bool(done), "output": first.is_file(),
+    "image_order": settings.get("image_order"), "included": [i["included"] for i in settings.get("images", [])],
+    "bgm": len(settings.get("bgm_segments", [])), "encoder": settings.get("video", {}).get("encoder_used"),
+    "frames": settings.get("video", {}).get("total_frames"),
+    "messages": [m for m in shown], "cancelled": bool(cancelled), "cancel_status": status,
+    "cancel_left_file": second.exists()}, ensure_ascii=False))
+'''
+
 MODELS = r'''
 import json, sys
 from pathlib import Path
@@ -306,6 +370,29 @@ class Verifier:
         self.check(f"{label}", good, f"{result['encoder_used']}・FFmpeg={result['ffmpeg']}・{info['frames']} フレーム・"
                                      f"{info['seconds']} 秒・映像 {info['video']}・音声 {info['audio']}・{info['bytes']:,} バイト")
 
+    def gui_flow(self, label: str, app: Path, media, env: dict) -> None:
+        """画面の操作の流れ（フォルダー → 並べ替え → 使わない写真 → BGM → 作成 → 中止）を、画面の部品を直接動かして確かめる。"""
+        photos, track = media
+        out = self.work / "_output"
+        out.mkdir(exist_ok=True)
+        r = self.python(app, GUI_FLOW, str(photos), str(track), str(out), env=env, cwd=self.work, name="gui_flow")
+        if r is None:
+            return
+        files = sorted(p.name for p in photos.glob("*.jpg"))
+        self.check(f"{label}: 写真フォルダーを開くと自然順で 4 枚", r["loaded"] == files, str(r["loaded"]))
+        self.check(f"{label}: 並べ替えと「使わない」が動画に反映される",
+                   r["done"] and r["output"] and r["image_order"] == [files[1], files[0], files[2]]
+                   and r["included"] == [True, True, True, False], f"上映順 {r['image_order']}")
+        self.check(f"{label}: BGM 付きで完成し、完成の表示が出る",
+                   r["bgm"] == 1 and r["frames"] == (2 + 3 * 2) * 24 and any("完成しました" in m[1] for m in r["messages"])
+                   and not any(m[0] == "showerror" for m in r["messages"]), f"{r['encoder']}・{r['frames']} フレーム")
+        self.check(f"{label}: 「中止」で止まり、作りかけを残さない",
+                   r["cancelled"] and r["cancel_status"] == "中止しました。" and not r["cancel_left_file"], r["cancel_status"])
+        probe_ok = probe(out / "画面から作成.mp4") if r["output"] else {}
+        self.check(f"{label}: 画面から作った MP4 が再生できる形（h264 + aac）",
+                   probe_ok.get("video") == "h264" and probe_ok.get("audio") == "aac" and probe_ok.get("decodes_cleanly"),
+                   f"{probe_ok.get('seconds')} 秒")
+
     def cli(self, label: str, app: Path, media, env: dict) -> None:
         photos, track = media
         py = str(app / ".venv" / "Scripts" / "python.exe")
@@ -374,6 +461,8 @@ def main(argv: list[str]) -> int:
             versions["python"] = pyver
             v.check("パッケージが .venv に入っている", set(PACKAGES) <= set(versions), json.dumps(versions))
             v.start_gui("ふつうの場所", app, version)
+            print("\n== 画面の操作の流れ ==", flush=True)
+            v.gui_flow("画面", app, media, env)
             print("\n== 書き出し ==", flush=True)
             v.render("書き出し: 写真だけ（自動）", app, media, env, encoder="auto", bgm=False)
             v.render("書き出し: BGM 付き・CPU x264（NVIDIA 無しでも動く）", app, media, env, encoder="cpu", expect_encoder="CPU x264")
