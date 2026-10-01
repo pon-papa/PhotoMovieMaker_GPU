@@ -380,7 +380,9 @@ def scan_music(folder) -> dict:
     return {"folder": str(root), "count": len(tracks),
             "tracks": [{"file": p.name, "format": p.suffix.lower()[1:], "bytes": p.stat().st_size,
                         "modified": _iso(p.stat().st_mtime)} for p in tracks],
-            "skipped_files": max(0, others), "formats": sorted(AUDIO_SUFFIXES)}
+            "skipped_files": max(0, others), "formats": sorted(AUDIO_SUFFIXES),
+            # analyze_music を offset / limit で分けて呼ぶときに渡す（途中で一覧が変わったら止まる）
+            "listing_fingerprint": listing_fingerprint(tracks), "page_size_max": MAX_TRACKS}
 
 
 def _probe_track(ffprobe: str | None, path: Path) -> dict:
@@ -482,41 +484,86 @@ def _envelope(samples) -> dict:
             "energy_profile": profile}
 
 
-def analyze_music(folder, *, progress=None, should_stop=None) -> dict:
+def listing_fingerprint(tracks: list[Path]) -> str:
+    """曲の一覧（自然順のファイル名・大きさ・更新時刻）の指紋。ページの間にフォルダーが変わっていないかを見る。"""
+    rows = []
+    for p in tracks:
+        try:
+            st = p.stat()
+            rows.append([p.name, st.st_size, st.st_mtime_ns])
+        except OSError:
+            rows.append([p.name, None, None])
+    return hashlib.sha256(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()[:32]
+
+
+def _measure_track(ffmpeg: str, ffprobe: str | None, path: Path) -> dict:
+    samples = _decode_mono(ffmpeg, path)
+    entry = {"file": path.name, "format": path.suffix.lower()[1:],
+             "duration_seconds": round(len(samples) / ANALYSIS_RATE, 2)}
+    entry.update(_probe_track(ffprobe, path))
+    entry["loudness"] = _loudness(ffmpeg, path)
+    entry.update(_envelope(samples))
+    entry["tempo"] = {"bpm": None, "beats": None, "status": "unknown",
+                      "reason": "テンポと拍を測る仕組みはまだ無い（依存を増やさないため）"}
+    return entry
+
+
+def analyze_music(folder, *, offset=None, limit=None, expect_fingerprint=None,
+                  progress=None, should_stop=None) -> dict:
     """曲のフォルダー直下の曲を、技術的に測れることだけ測る。曲は読むだけ。
 
     測る: 長さ・形式・サンプルレート・チャンネル・ビットレート・ファイルのメタデータ（書かれていれば）・
     統合ラウドネス・トゥルーピーク・1 秒ごとの音量の推移・無音・静かな区間・10 区分の音量の概形。
     測らない（unknown）: テンポ（BPM）・拍・曲の雰囲気。雰囲気の推定は呼び出し側（SI）の判断で、事実ではない。
+
+    曲が 30 曲を超えるフォルダーは、offset / limit で 30 曲ずつ（自然順のページ）測る（SI Director v2）。
+    offset / limit を指定しないときは従来どおり 30 曲まで（超えると too_many_tracks）。
+    expect_fingerprint（scan_music の listing_fingerprint）を渡すと、ページの間に曲の一覧が変わったとき
+    folder_changed で止まる（順番がずれたまま続けない）。読めなかった曲は failures に入れて続ける。
     """
     root = resolve_folder(folder)
     tracks = list_tracks(root)
-    if len(tracks) > MAX_TRACKS:
-        raise CoreError("too_many_tracks", f"曲は {MAX_TRACKS} 曲までにしてください（{len(tracks)} 曲あります）。")
+    fingerprint = listing_fingerprint(tracks)
+    if expect_fingerprint is not None and expect_fingerprint != fingerprint:
+        raise CoreError("folder_changed", "曲の一覧が scan_music のときと変わりました。もう一度 scan_music から始めてください。")
+    paged = offset is not None or limit is not None
+    if not paged and len(tracks) > MAX_TRACKS:
+        raise CoreError("too_many_tracks", f"曲は {MAX_TRACKS} 曲までにしてください（{len(tracks)} 曲あります）。"
+                                           f"offset / limit を指定すると {MAX_TRACKS} 曲ずつ測れます。")
+    if paged:
+        offset = 0 if offset is None else offset
+        limit = MAX_TRACKS if limit is None else limit
+        if not (isinstance(offset, int) and not isinstance(offset, bool) and 0 <= offset <= len(tracks)):
+            raise CoreError("invalid_page", f"offset は 0〜{len(tracks)} の整数です。")
+        if not (isinstance(limit, int) and not isinstance(limit, bool) and 1 <= limit <= MAX_TRACKS):
+            raise CoreError("invalid_page", f"limit は 1〜{MAX_TRACKS} の整数です。")
+    else:
+        offset, limit = 0, max(1, len(tracks))
+    page = tracks[offset:offset + limit]
     stop = should_stop or (lambda: False)
     ffmpeg, ffprobe = app.find_ffmpeg(), find_ffprobe()
-    results = []
-    for index, path in enumerate(tracks, 1):
+    results, failures = [], []
+    for index, path in enumerate(page, 1):
         if stop():
             raise CancelledError()
         if progress:
-            progress("music", index - 1, len(tracks))
-        samples = _decode_mono(ffmpeg, path)
-        entry = {"file": path.name, "format": path.suffix.lower()[1:],
-                 "duration_seconds": round(len(samples) / ANALYSIS_RATE, 2)}
-        entry.update(_probe_track(ffprobe, path))
-        entry["loudness"] = _loudness(ffmpeg, path)
-        entry.update(_envelope(samples))
-        entry["tempo"] = {"bpm": None, "beats": None, "status": "unknown",
-                          "reason": "テンポと拍を測る仕組みはまだ無い（依存を増やさないため）"}
-        results.append(entry)
+            progress("music", index - 1, len(page))
+        try:
+            results.append(_measure_track(ffmpeg, ffprobe, path))
+        except CoreError as e:
+            failures.append({"file": path.name, "code": e.code, "message": e.message})
     if progress:
-        progress("music", len(tracks), len(tracks))
+        progress("music", len(page), len(page))
+    following = offset + len(page)
     return {
-        "folder": str(root), "count": len(results), "tracks": results,
+        "folder": str(root), "count": len(results), "tracks": results, "failures": failures,
+        "total": len(tracks), "offset": offset, "limit": limit,
+        "next_offset": following if following < len(tracks) else None,
+        "listing_fingerprint": fingerprint,
         "method": {"decode": f"FFmpeg で mono {ANALYSIS_RATE} Hz にまとめて 1 秒ごとの RMS を計算",
                    "loudness": "FFmpeg ebur128（EBU R128）", "silence_threshold_dbfs": SILENCE_DB,
-                   "quiet_below_track_rms_db": QUIET_BELOW_DB, "ffprobe": bool(ffprobe)},
+                   "quiet_below_track_rms_db": QUIET_BELOW_DB, "ffprobe": bool(ffprobe),
+                   "page_size_max": MAX_TRACKS},
         "unknown": ["tempo_bpm", "beats", "mood"],
         "notes": ["値は技術的な測定。明るい・穏やか・懐かしいなどの雰囲気は測っていない（推定するなら推定として扱う）",
                   "曲は必ず先頭から使われ、短い曲は区間の長さまで繰り返される（画面の BGM と同じ）"],

@@ -13,6 +13,7 @@ ToolDock の MCP Sidecar は、このコマンドを通して PhotoMovieMaker �
 
     py -3 pmm_cli.py music-scan --folder "C:\\曲"
     py -3 pmm_cli.py music-analyze --folder "C:\\曲"
+    py -3 pmm_cli.py music-analyze --folder "C:\\曲" --offset 30 --limit 30 --expect-fingerprint <music-scan の値>
     py -3 pmm_cli.py compose --folder "C:\\写真\\旅行" --edits-json "{...}" --save 作品.photomovie.json [--music-folder "C:\\曲"]
     py -3 pmm_cli.py preview --project 作品.photomovie.json --folder "C:\\写真\\旅行" [--music-folder "C:\\曲"]
     py -3 pmm_cli.py director --project 作品.photomovie.json --plan-json "{...}" [--overwrite]
@@ -74,6 +75,9 @@ def build_parser() -> argparse.ArgumentParser:
     ms.add_argument("--folder", required=True)
     ma = sub.add_parser("music-analyze", help="曲を技術的に測る（長さ・音量の推移・無音など）")
     ma.add_argument("--folder", required=True)
+    ma.add_argument("--offset", type=int, help="ページの先頭（0 から）。30 曲を超えるフォルダーで使う")
+    ma.add_argument("--limit", type=int, help="1 ページの曲数（1〜30）")
+    ma.add_argument("--expect-fingerprint", help="music-scan の listing_fingerprint（一覧が変わったら止まる）")
     c = sub.add_parser("compose", help="SI の決めた選択・順序・タイトル・BGM 区間で Project JSON を組み立てて保存する")
     c.add_argument("--folder", required=True)
     c.add_argument("--edits-json", required=True)
@@ -151,7 +155,9 @@ def run(argv: list[str]) -> int:
         elif args.command == "music-scan":
             result = core.scan_music(args.folder)
         elif args.command == "music-analyze":
-            result = core.analyze_music(args.folder, progress=progress, should_stop=should_stop)
+            result = core.analyze_music(args.folder, offset=args.offset, limit=args.limit,
+                                        expect_fingerprint=args.expect_fingerprint,
+                                        progress=progress, should_stop=should_stop)
         elif args.command == "compose":
             result = core.compose_project(args.folder, _json_argument(args.edits_json, "edits_json"), args.save,
                                           music_folder=args.music_folder, overwrite=args.overwrite)

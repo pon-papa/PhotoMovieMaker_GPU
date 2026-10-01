@@ -184,13 +184,19 @@
     {
       "name": "analyze_music",
       "title": "曲を技術的に測る",
-      "description": "曲のフォルダー直下の曲（30 曲まで）について、長さ・形式・サンプルレート・チャンネル・メタデータ（書かれていれば）・統合ラウドネス（EBU R128）・トゥルーピーク・1 秒ごとの音量の推移・無音・静かな区間・10 区分の音量の概形を返します。テンポ・拍・雰囲気は測りません（unknown）。曲は読むだけです。",
+      "description": "曲のフォルダー直下の曲（1 回 30 曲まで。それより多いときは offset / limit で 30 曲ずつ。結果の next_offset が null になるまで続け、scan_music の listing_fingerprint を expect_fingerprint に渡す）について、長さ・形式・サンプルレート・チャンネル・メタデータ（書かれていれば）・統合ラウドネス（EBU R128）・トゥルーピーク・1 秒ごとの音量の推移・無音・静かな区間・10 区分の音量の概形を返します。テンポ・拍・雰囲気は測りません（unknown）。曲は読むだけです。",
       "command": "music-analyze",
       "access": "read",
       "input_schema": {
         "type": "object",
         "properties": {
-          "music_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder"}
+          "music_folder": {"type": "string", "minLength": 3, "maxLength": 1000, "x-path": "media_folder", "x-flag": "--folder"},
+          "offset": {"type": "integer", "minimum": 0, "maximum": 100000, "x-flag": "--offset",
+                     "description": "ページの先頭（0 から）。30 曲を超えるフォルダーは offset / limit で 30 曲ずつ測る"},
+          "limit": {"type": "integer", "minimum": 1, "maximum": 30, "x-flag": "--limit",
+                    "description": "1 ページの曲数（1〜30）"},
+          "expect_fingerprint": {"type": "string", "minLength": 8, "maxLength": 64, "x-flag": "--expect-fingerprint",
+                                 "description": "scan_music の listing_fingerprint。ページの間に曲の一覧が変わったら folder_changed で止まる"}
         },
         "required": ["music_folder"],
         "additionalProperties": false
